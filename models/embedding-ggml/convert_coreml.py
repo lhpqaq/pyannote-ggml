@@ -59,15 +59,11 @@ class ResNetEmbeddingWrapper(nn.Module):
         x = self.layer4(x)             # (B, 256, 10, T/8)
 
         # TSTP pooling — native ops replace einops.rearrange for tracing
-        batch, dim, chan, frames = x.shape
-        x = x.reshape(batch, dim * chan, frames)  # (B, 2560, T/8)
+        x = torch.flatten(x, 1, 2)     # (B, 2560, T/8)
 
-        # Bessel-corrected stats: std = sqrt(sum((x-mean)^2) / (N-1))
+        # Simple stats calculation for CoreML compatibility
         mean = x.mean(dim=-1)
-        n = x.shape[-1]
-        diff = x - mean.unsqueeze(-1)
-        var = (diff * diff).sum(dim=-1) / (n - 1)
-        std = torch.sqrt(var + 1e-8)
+        std = x.std(dim=-1, unbiased=False)
         stats = torch.cat([mean, std], dim=-1)  # (B, 5120)
 
         return self.seg_1(stats)  # (B, 256)
