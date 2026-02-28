@@ -151,12 +151,9 @@ bool extract_embeddings(
     int          num_chunks,
     int          num_frames_per_chunk,
     int          num_speakers,
-#ifdef EMBEDDING_USE_COREML
     struct embedding_coreml_context* coreml_ctx,
-#else
-    embedding::embedding_model& emb_model,
-    embedding::embedding_state& emb_state,
-#endif
+    embedding::embedding_model* emb_model,
+    embedding::embedding_state* emb_state,
     float*       embeddings_out)
 {
     std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
@@ -220,16 +217,24 @@ bool extract_embeddings(
                 }
             }
 
+            if (coreml_ctx) {
 #ifdef EMBEDDING_USE_COREML
-            embedding_coreml_encode(coreml_ctx,
-                                    static_cast<int64_t>(num_fbank_frames),
-                                    masked_fbank.data(),
-                                    emb_out);
+                embedding_coreml_encode(coreml_ctx,
+                                        static_cast<int64_t>(num_fbank_frames),
+                                        masked_fbank.data(),
+                                        emb_out);
 #else
-            embedding::model_infer(emb_model, emb_state,
-                                   masked_fbank.data(), num_fbank_frames,
-                                   emb_out, EMBEDDING_DIM);
+                fprintf(stderr, "Error: CoreML embedding requested but EMBEDDING_USE_COREML is disabled\n");
+                return false;
 #endif
+            } else if (emb_model && emb_state) {
+                embedding::model_infer(*emb_model, *emb_state,
+                                       masked_fbank.data(), num_fbank_frames,
+                                       emb_out, EMBEDDING_DIM);
+            } else {
+                fprintf(stderr, "Error: no embedding backend available\n");
+                return false;
+            }
         }
     }
 
@@ -331,37 +336,41 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     // ====================================================================
 
     t_stage_start = Clock::now();
-#ifdef EMBEDDING_USE_COREML
     struct embedding_coreml_context* coreml_ctx = nullptr;
-    if (!config.coreml_path.empty()) {
-        coreml_ctx = embedding_coreml_init(config.coreml_path.c_str());
-    }
-    if (!coreml_ctx) {
-        fprintf(stderr, "Error: failed to load CoreML embedding model '%s'\n",
-                config.coreml_path.c_str());
-        if (seg_state.sched) segmentation::state_free(seg_state);
-        if (seg_model.ctx) segmentation::model_free(seg_model);
-        return false;
-    }
-#else
-    embedding::embedding_model emb_model;
-    embedding::embedding_state emb_state;
+    bool use_emb_coreml = false;
+    embedding::embedding_model emb_model = {};
+    embedding::embedding_state emb_state = {};
 
-    if (!embedding::model_load(config.emb_model_path, emb_model, false)) {
-        fprintf(stderr, "Error: failed to load embedding model '%s'\n",
-                config.emb_model_path.c_str());
-        if (seg_state.sched) segmentation::state_free(seg_state);
-        if (seg_model.ctx) segmentation::model_free(seg_model);
-        return false;
-    }
-    if (!embedding::state_init(emb_state, emb_model, false)) {
-        fprintf(stderr, "Error: failed to initialize embedding state\n");
-        embedding::model_free(emb_model);
-        if (seg_state.sched) segmentation::state_free(seg_state);
-        if (seg_model.ctx) segmentation::model_free(seg_model);
-        return false;
+#ifdef EMBEDDING_USE_COREML
+    use_emb_coreml = !config.coreml_path.empty();
+    if (use_emb_coreml) {
+        coreml_ctx = embedding_coreml_init(config.coreml_path.c_str());
+        if (!coreml_ctx) {
+            fprintf(stderr, "Error: failed to load CoreML embedding model '%s'\n",
+                    config.coreml_path.c_str());
+            if (seg_state.sched) segmentation::state_free(seg_state);
+            if (seg_model.ctx) segmentation::model_free(seg_model);
+            return false;
+        }
     }
 #endif
+
+    if (!use_emb_coreml) {
+        if (!embedding::model_load(config.emb_model_path, emb_model, false)) {
+            fprintf(stderr, "Error: failed to load embedding model '%s'\n",
+                    config.emb_model_path.c_str());
+            if (seg_state.sched) segmentation::state_free(seg_state);
+            if (seg_model.ctx) segmentation::model_free(seg_model);
+            return false;
+        }
+        if (!embedding::state_init(emb_state, emb_model, false)) {
+            fprintf(stderr, "Error: failed to initialize embedding state\n");
+            embedding::model_free(emb_model);
+            if (seg_state.sched) segmentation::state_free(seg_state);
+            if (seg_model.ctx) segmentation::model_free(seg_model);
+            return false;
+        }
+    }
     
     t_stage_end = Clock::now();
     t_load_emb_model_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
@@ -564,11 +573,9 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         if (!extract_embeddings(
                 audio, n_samples,
                 binarized.data(), num_chunks, FRAMES_PER_CHUNK, NUM_LOCAL_SPEAKERS,
-#ifdef EMBEDDING_USE_COREML
                 coreml_ctx,
-#else
-                emb_model, emb_state,
-#endif
+                use_emb_coreml ? nullptr : &emb_model,
+                use_emb_coreml ? nullptr : &emb_state,
                 embeddings.data())) {
             fprintf(stderr, "Error: embedding extraction failed\n");
             goto cleanup;
@@ -579,15 +586,17 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         fprintf(stderr, "done [%.0f ms]\n", t_embeddings_ms);
 
         // Free embedding model — no longer needed
+        if (coreml_ctx) {
 #ifdef EMBEDDING_USE_COREML
-        embedding_coreml_free(coreml_ctx);
-        coreml_ctx = nullptr;
-#else
-        embedding::state_free(emb_state);
-        embedding::model_free(emb_model);
-        emb_state.sched = nullptr;
-        emb_model.ctx = nullptr;
+            embedding_coreml_free(coreml_ctx);
+            coreml_ctx = nullptr;
 #endif
+        } else {
+            embedding::state_free(emb_state);
+            embedding::model_free(emb_model);
+            emb_state.sched = nullptr;
+            emb_model.ctx = nullptr;
+        }
 
 
         // ================================================================
@@ -943,21 +952,25 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
 
     // --- cleanup labels for error/early-exit paths ---
 cleanup_emb:
+    if (coreml_ctx) {
 #ifdef EMBEDDING_USE_COREML
-    if (coreml_ctx) embedding_coreml_free(coreml_ctx);
-#else
-    if (emb_state.sched) embedding::state_free(emb_state);
-    if (emb_model.ctx) embedding::model_free(emb_model);
+        embedding_coreml_free(coreml_ctx);
 #endif
+    } else {
+        if (emb_state.sched) embedding::state_free(emb_state);
+        if (emb_model.ctx) embedding::model_free(emb_model);
+    }
     return true;
 
 cleanup:
+    if (coreml_ctx) {
 #ifdef EMBEDDING_USE_COREML
-    if (coreml_ctx) embedding_coreml_free(coreml_ctx);
-#else
-    if (emb_state.sched) embedding::state_free(emb_state);
-    if (emb_model.ctx) embedding::model_free(emb_model);
+        embedding_coreml_free(coreml_ctx);
 #endif
+    } else {
+        if (emb_state.sched) embedding::state_free(emb_state);
+        if (emb_model.ctx) embedding::model_free(emb_model);
+    }
 #ifdef SEGMENTATION_USE_COREML
     if (seg_coreml_ctx) segmentation_coreml_free(seg_coreml_ctx);
 #endif
@@ -1135,6 +1148,8 @@ bool diarize_from_samples_with_models(
                 audio, n_samples,
                 binarized.data(), num_chunks, FRAMES_PER_CHUNK, NUM_LOCAL_SPEAKERS,
                 emb_ctx,
+                nullptr,
+                nullptr,
                 embeddings.data())) {
             fprintf(stderr, "Error: embedding extraction failed\n");
             return false;

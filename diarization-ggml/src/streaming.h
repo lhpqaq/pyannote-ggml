@@ -25,6 +25,10 @@ StreamingState* streaming_init_with_models(
     const StreamingConfig& config,
     struct segmentation_coreml_context* seg_ctx,
     struct embedding_coreml_context* emb_ctx,
+    segmentation::segmentation_model* seg_model,
+    segmentation::segmentation_state* seg_state,
+    embedding::embedding_model* emb_model,
+    embedding::embedding_state* emb_state,
     const diarization::PLDAModel& plda);
 
 // Push audio samples. Returns VAD chunks for each newly processed segmentation chunk.

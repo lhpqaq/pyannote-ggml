@@ -195,7 +195,14 @@ PipelineState* pipeline_init_with_cache(
     StreamingConfig diar_config = config.diarization;
     diar_config.zero_latency = true;
     state->streaming_state = streaming_init_with_models(
-        diar_config, cache->seg_coreml_ctx, cache->emb_coreml_ctx, cache->plda);
+        diar_config,
+        cache->seg_coreml_ctx,
+        cache->emb_coreml_ctx,
+        cache->seg_ggml_loaded ? &cache->seg_model : nullptr,
+        cache->seg_ggml_loaded ? &cache->seg_state : nullptr,
+        cache->emb_ggml_loaded ? &cache->emb_model : nullptr,
+        cache->emb_ggml_loaded ? &cache->emb_state : nullptr,
+        cache->plda);
     if (!state->streaming_state) {
         fprintf(stderr, "ERROR: failed to init streaming diarization (with cache)\n");
         silence_filter_free(state->silence_filter);

@@ -31,6 +31,42 @@ static constexpr int EMBEDDING_DIM           = 256;
 static constexpr int FBANK_NUM_BINS          = 80;
 static constexpr double FRAME_STEP_SEC       = 0.016875;
 
+static void free_owned_models(StreamingState* state) {
+    if (!state || !state->owns_models) {
+        return;
+    }
+
+#ifdef SEGMENTATION_USE_COREML
+    if (state->seg_coreml_ctx) {
+        segmentation_coreml_free(state->seg_coreml_ctx);
+        state->seg_coreml_ctx = nullptr;
+    }
+#endif
+
+#ifdef EMBEDDING_USE_COREML
+    if (state->emb_coreml_ctx) {
+        embedding_coreml_free(state->emb_coreml_ctx);
+        state->emb_coreml_ctx = nullptr;
+    }
+#endif
+
+    if (state->seg_state.sched) {
+        segmentation::state_free(state->seg_state);
+    }
+    if (state->seg_model.ctx) {
+        segmentation::model_free(state->seg_model);
+    }
+    if (state->emb_state.sched) {
+        embedding::state_free(state->emb_state);
+    }
+    if (state->emb_model.ctx) {
+        embedding::model_free(state->emb_model);
+    }
+
+    state->use_seg_ggml = false;
+    state->use_emb_ggml = false;
+}
+
 static int chunk_global_start_frame(int chunk_idx) {
     return static_cast<int>(std::lround(
         static_cast<double>(chunk_idx) * 1.0 / FRAME_STEP_SEC));
@@ -65,20 +101,41 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
 
     std::vector<float> chunk_logits(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
 
+    bool seg_ok = false;
 #ifdef SEGMENTATION_USE_COREML
     if (state->seg_coreml_ctx) {
         segmentation_coreml_infer(state->seg_coreml_ctx,
                                   cropped.data(), CHUNK_SAMPLES,
                                   chunk_logits.data(),
                                   FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
-    } else {
+        seg_ok = true;
+    }
+#endif
+
+    if (!seg_ok && state->use_seg_ggml) {
+        if (!segmentation::model_infer(state->seg_model, state->seg_state,
+                                       cropped.data(), CHUNK_SAMPLES,
+                                       chunk_logits.data(),
+                                       FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES)) {
+            fprintf(stderr, "Error: GGML segmentation failed\n");
+            return false;
+        }
+
+        std::vector<float> tmp(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+        std::memcpy(tmp.data(), chunk_logits.data(), tmp.size() * sizeof(float));
+        for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
+            for (int k = 0; k < NUM_POWERSET_CLASSES; k++) {
+                chunk_logits[f * NUM_POWERSET_CLASSES + k] =
+                    tmp[k * FRAMES_PER_CHUNK + f];
+            }
+        }
+        seg_ok = true;
+    }
+
+    if (!seg_ok) {
         fprintf(stderr, "Error: no segmentation model available\n");
         return false;
     }
-#else
-    fprintf(stderr, "Error: non-CoreML segmentation not supported in streaming\n");
-    return false;
-#endif
 
     std::vector<float> chunk_binarized(FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS);
     diarization::powerset_to_multilabel(
@@ -127,20 +184,31 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
                 }
             }
 
+            bool emb_ok = false;
 #ifdef EMBEDDING_USE_COREML
             if (state->emb_coreml_ctx) {
                 embedding_coreml_encode(state->emb_coreml_ctx,
                                        static_cast<int64_t>(num_fbank_frames),
                                        masked_fbank.data(),
                                        embedding.data());
-            } else {
-                fprintf(stderr, "Error: no embedding model available\n");
-                continue;
+                emb_ok = true;
             }
-#else
-            fprintf(stderr, "Error: non-CoreML embedding not supported in streaming\n");
-            continue;
 #endif
+
+            if (!emb_ok && state->use_emb_ggml) {
+                if (!embedding::model_infer(state->emb_model, state->emb_state,
+                                            masked_fbank.data(), num_fbank_frames,
+                                            embedding.data(), EMBEDDING_DIM)) {
+                    fprintf(stderr, "Error: GGML embedding failed\n");
+                    return false;
+                }
+                emb_ok = true;
+            }
+
+            if (!emb_ok) {
+                fprintf(stderr, "Error: no embedding model available\n");
+                return false;
+            }
         }
 
         state->embeddings.insert(
@@ -169,8 +237,11 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
 StreamingState* streaming_init(const StreamingConfig& config) {
     StreamingState* state = new StreamingState();
     state->config = config;
-    
-    // Load segmentation CoreML model
+
+    bool has_seg_model = false;
+    bool has_emb_model = false;
+
+    // Load segmentation CoreML model (optional)
 #ifdef SEGMENTATION_USE_COREML
     if (!config.seg_coreml_path.empty()) {
         state->seg_coreml_ctx = segmentation_coreml_init(config.seg_coreml_path.c_str());
@@ -180,36 +251,80 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
+        has_seg_model = true;
     }
 #endif
-    
-    // Load embedding CoreML model
+
+    // Load embedding CoreML model (optional)
 #ifdef EMBEDDING_USE_COREML
     if (!config.coreml_path.empty()) {
         state->emb_coreml_ctx = embedding_coreml_init(config.coreml_path.c_str());
         if (!state->emb_coreml_ctx) {
             fprintf(stderr, "Error: failed to load CoreML embedding model '%s'\n",
                     config.coreml_path.c_str());
-#ifdef SEGMENTATION_USE_COREML
-            if (state->seg_coreml_ctx) segmentation_coreml_free(state->seg_coreml_ctx);
-#endif
+            free_owned_models(state);
             delete state;
             return nullptr;
         }
+        has_emb_model = true;
     }
 #endif
+
+    // Fallback to GGML segmentation when CoreML isn't provided
+    if (!has_seg_model) {
+        if (config.seg_model_path.empty()) {
+            fprintf(stderr, "Error: segmentation model path is required when CoreML path is not provided\n");
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        if (!segmentation::model_load(config.seg_model_path, state->seg_model, false)) {
+            fprintf(stderr, "Error: failed to load segmentation model '%s'\n",
+                    config.seg_model_path.c_str());
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        if (!segmentation::state_init(state->seg_state, state->seg_model, false)) {
+            fprintf(stderr, "Error: failed to initialize segmentation state\n");
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        state->use_seg_ggml = true;
+        has_seg_model = true;
+    }
+
+    // Fallback to GGML embedding when CoreML isn't provided
+    if (!has_emb_model) {
+        if (config.emb_model_path.empty()) {
+            fprintf(stderr, "Error: embedding model path is required when CoreML path is not provided\n");
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        if (!embedding::model_load(config.emb_model_path, state->emb_model, false)) {
+            fprintf(stderr, "Error: failed to load embedding model '%s'\n",
+                    config.emb_model_path.c_str());
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        if (!embedding::state_init(state->emb_state, state->emb_model, false)) {
+            fprintf(stderr, "Error: failed to initialize embedding state\n");
+            free_owned_models(state);
+            delete state;
+            return nullptr;
+        }
+        state->use_emb_ggml = true;
+    }
     
     // Load PLDA model
     if (!config.plda_path.empty()) {
         if (!diarization::plda_load(config.plda_path, state->plda)) {
             fprintf(stderr, "Error: failed to load PLDA model '%s'\n",
                     config.plda_path.c_str());
-#ifdef EMBEDDING_USE_COREML
-            if (state->emb_coreml_ctx) embedding_coreml_free(state->emb_coreml_ctx);
-#endif
-#ifdef SEGMENTATION_USE_COREML
-            if (state->seg_coreml_ctx) segmentation_coreml_free(state->seg_coreml_ctx);
-#endif
+            free_owned_models(state);
             delete state;
             return nullptr;
         }
@@ -228,12 +343,7 @@ StreamingState* streaming_init(const StreamingConfig& config) {
         state->audio_buffer.resize(CHUNK_SAMPLES, 0.0f);
         if (!process_one_chunk(state, CHUNK_SAMPLES)) {
             fprintf(stderr, "Error: failed to process silence chunk in zero_latency mode\n");
-#ifdef EMBEDDING_USE_COREML
-            if (state->emb_coreml_ctx) embedding_coreml_free(state->emb_coreml_ctx);
-#endif
-#ifdef SEGMENTATION_USE_COREML
-            if (state->seg_coreml_ctx) segmentation_coreml_free(state->seg_coreml_ctx);
-#endif
+            free_owned_models(state);
             delete state;
             return nullptr;
         }
@@ -247,6 +357,10 @@ StreamingState* streaming_init_with_models(
     const StreamingConfig& config,
     struct segmentation_coreml_context* seg_ctx,
     struct embedding_coreml_context* emb_ctx,
+    segmentation::segmentation_model* seg_model,
+    segmentation::segmentation_state* seg_state,
+    embedding::embedding_model* emb_model,
+    embedding::embedding_state* emb_state,
     const diarization::PLDAModel& plda)
 {
     StreamingState* state = new StreamingState();
@@ -256,6 +370,28 @@ StreamingState* streaming_init_with_models(
     // Use borrowed model handles (not freed in streaming_free)
     state->seg_coreml_ctx = seg_ctx;
     state->emb_coreml_ctx = emb_ctx;
+    if (seg_model && seg_state) {
+        state->seg_model = *seg_model;
+        state->seg_state = *seg_state;
+        state->use_seg_ggml = true;
+    }
+    if (emb_model && emb_state) {
+        state->emb_model = *emb_model;
+        state->emb_state = *emb_state;
+        state->use_emb_ggml = true;
+    }
+
+    if (!state->seg_coreml_ctx && !state->use_seg_ggml) {
+        fprintf(stderr, "Error: streaming_init_with_models requires segmentation model\n");
+        delete state;
+        return nullptr;
+    }
+    if (!state->emb_coreml_ctx && !state->use_emb_ggml) {
+        fprintf(stderr, "Error: streaming_init_with_models requires embedding model\n");
+        delete state;
+        return nullptr;
+    }
+
     state->plda = plda;  // copy the PLDA model
 
     state->chunks_processed = 0;
@@ -699,20 +835,8 @@ DiarizationResult streaming_finalize(StreamingState* state) {
 
 void streaming_free(StreamingState* state) {
     if (!state) return;
-    
-#ifdef SEGMENTATION_USE_COREML
-    if (state->owns_models && state->seg_coreml_ctx) {
-        segmentation_coreml_free(state->seg_coreml_ctx);
-        state->seg_coreml_ctx = nullptr;
-    }
-#endif
 
-#ifdef EMBEDDING_USE_COREML
-    if (state->owns_models && state->emb_coreml_ctx) {
-        embedding_coreml_free(state->emb_coreml_ctx);
-        state->emb_coreml_ctx = nullptr;
-    }
-#endif
+    free_owned_models(state);
     
     // Clear all vectors (automatic with delete, but explicit for clarity)
      state->audio_buffer.clear();

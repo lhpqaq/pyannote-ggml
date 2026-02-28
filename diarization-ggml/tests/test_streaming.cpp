@@ -156,13 +156,15 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --zero-latency        Enable zero-latency mode (pre-fill 10s silence)\n");
     fprintf(stderr, "  -o, --output <path>   Output RTTM file\n");
     fprintf(stderr, "  --plda <path>         Path to PLDA binary file\n");
-    fprintf(stderr, "  --coreml <path>       Path to CoreML embedding model\n");
-    fprintf(stderr, "  --seg-coreml <path>   Path to CoreML segmentation model\n");
+    fprintf(stderr, "  --seg-model <path>    Segmentation GGUF model path\n");
+    fprintf(stderr, "  --emb-model <path>    Embedding GGUF model path\n");
+    fprintf(stderr, "  --coreml <path>       Optional CoreML embedding model\n");
+    fprintf(stderr, "  --seg-coreml <path>   Optional CoreML segmentation model\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Default paths (if not specified):\n");
     fprintf(stderr, "  PLDA: plda.gguf\n");
-    fprintf(stderr, "  Embedding CoreML: ../models/embedding-ggml/embedding.mlpackage\n");
-    fprintf(stderr, "  Segmentation CoreML: ../models/segmentation-ggml/segmentation.mlpackage\n");
+    fprintf(stderr, "  Embedding GGUF: ../models/embedding-ggml/embedding.gguf\n");
+    fprintf(stderr, "  Segmentation GGUF: ../models/segmentation-ggml/segmentation.gguf\n");
 }
 
 // ============================================================================
@@ -174,8 +176,10 @@ int main(int argc, char** argv) {
     std::string audio_path;
     std::string output_path;
     std::string plda_path = "plda.gguf";
-    std::string coreml_path = "../embedding-ggml/embedding.mlpackage";
-    std::string seg_coreml_path = "../segmentation-ggml/segmentation.mlpackage";
+    std::string emb_model_path = "models/embedding-ggml/embedding.gguf";
+    std::string seg_model_path = "models/segmentation-ggml/segmentation.gguf";
+    std::string coreml_path;
+    std::string seg_coreml_path;
     
     bool init_only = false;
     bool push_only = false;
@@ -214,6 +218,10 @@ int main(int argc, char** argv) {
             output_path = argv[++i];
         } else if (arg == "--plda" && i + 1 < argc) {
             plda_path = argv[++i];
+        } else if (arg == "--seg-model" && i + 1 < argc) {
+            seg_model_path = argv[++i];
+        } else if (arg == "--emb-model" && i + 1 < argc) {
+            emb_model_path = argv[++i];
         } else if (arg == "--coreml" && i + 1 < argc) {
             coreml_path = argv[++i];
         } else if (arg == "--seg-coreml" && i + 1 < argc) {
@@ -229,6 +237,8 @@ int main(int argc, char** argv) {
     
     StreamingConfig config;
     config.plda_path = plda_path;
+    config.emb_model_path = emb_model_path;
+    config.seg_model_path = seg_model_path;
     config.coreml_path = coreml_path;
     config.seg_coreml_path = seg_coreml_path;
     config.zero_latency = zero_latency;

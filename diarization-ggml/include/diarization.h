@@ -52,10 +52,7 @@ bool extract_embeddings(
     int          num_chunks,
     int          num_frames_per_chunk,
     int          num_speakers,
-#ifdef EMBEDDING_USE_COREML
     struct embedding_coreml_context* coreml_ctx,
-#else
-    embedding::embedding_model& emb_model,
-    embedding::embedding_state& emb_state,
-#endif
+    embedding::embedding_model* emb_model,
+    embedding::embedding_state* emb_state,
     float*       embeddings_out);

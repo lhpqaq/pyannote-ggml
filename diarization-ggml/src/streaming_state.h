@@ -1,6 +1,10 @@
 #pragma once
+#include <string>
 #include <vector>
 #include "plda.h"  // for PLDAModel
+
+#include "../../models/segmentation-ggml/src/model.h"
+#include "../../models/embedding-ggml/src/model.h"
 
 // Forward declarations for CoreML contexts
 struct embedding_coreml_context;
@@ -51,6 +55,14 @@ struct StreamingState {
     bool owns_models = true;
     struct segmentation_coreml_context* seg_coreml_ctx = nullptr;
     struct embedding_coreml_context* emb_coreml_ctx = nullptr;
+
+    // GGML models/states (used when CoreML is unavailable or not requested)
+    bool use_seg_ggml = false;
+    bool use_emb_ggml = false;
+    segmentation::segmentation_model seg_model = {};
+    segmentation::segmentation_state seg_state = {};
+    embedding::embedding_model emb_model = {};
+    embedding::embedding_state emb_state = {};
     
     // PLDA model
     diarization::PLDAModel plda;

@@ -10,8 +10,61 @@
 
 #include <cstdio>
 
+static void free_ggml_diarization_models(ModelCache* cache) {
+    if (!cache) {
+        return;
+    }
+
+    if (cache->emb_ggml_loaded) {
+        embedding::state_free(cache->emb_state);
+        embedding::model_free(cache->emb_model);
+        cache->emb_ggml_loaded = false;
+    }
+    if (cache->seg_ggml_loaded) {
+        segmentation::state_free(cache->seg_state);
+        segmentation::model_free(cache->seg_model);
+        cache->seg_ggml_loaded = false;
+    }
+}
+
 ModelCache* model_cache_load(const ModelCacheConfig& config) {
     auto* cache = new ModelCache();
+
+    // Load GGML segmentation model/state (optional fallback when CoreML is unavailable)
+    if (!config.seg_model_path.empty()) {
+        if (!segmentation::model_load(config.seg_model_path, cache->seg_model, false)) {
+            fprintf(stderr, "model_cache_load: failed to load segmentation GGML model '%s'\n",
+                    config.seg_model_path.c_str());
+            free_ggml_diarization_models(cache);
+            delete cache;
+            return nullptr;
+        }
+        if (!segmentation::state_init(cache->seg_state, cache->seg_model, false)) {
+            fprintf(stderr, "model_cache_load: failed to init segmentation GGML state\n");
+            free_ggml_diarization_models(cache);
+            delete cache;
+            return nullptr;
+        }
+        cache->seg_ggml_loaded = true;
+    }
+
+    // Load GGML embedding model/state (optional fallback when CoreML is unavailable)
+    if (!config.emb_model_path.empty()) {
+        if (!embedding::model_load(config.emb_model_path, cache->emb_model, false)) {
+            fprintf(stderr, "model_cache_load: failed to load embedding GGML model '%s'\n",
+                    config.emb_model_path.c_str());
+            free_ggml_diarization_models(cache);
+            delete cache;
+            return nullptr;
+        }
+        if (!embedding::state_init(cache->emb_state, cache->emb_model, false)) {
+            fprintf(stderr, "model_cache_load: failed to init embedding GGML state\n");
+            free_ggml_diarization_models(cache);
+            delete cache;
+            return nullptr;
+        }
+        cache->emb_ggml_loaded = true;
+    }
 
     // Step 1: Load segmentation CoreML model
 #ifdef SEGMENTATION_USE_COREML
@@ -20,6 +73,7 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
         if (!cache->seg_coreml_ctx) {
             fprintf(stderr, "model_cache_load: failed to load CoreML segmentation model '%s'\n",
                     config.seg_coreml_path.c_str());
+            free_ggml_diarization_models(cache);
             delete cache;
             return nullptr;
         }
@@ -36,6 +90,7 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 #ifdef SEGMENTATION_USE_COREML
             if (cache->seg_coreml_ctx) segmentation_coreml_free(cache->seg_coreml_ctx);
 #endif
+            free_ggml_diarization_models(cache);
             delete cache;
             return nullptr;
         }
@@ -53,6 +108,7 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 #ifdef SEGMENTATION_USE_COREML
             if (cache->seg_coreml_ctx) segmentation_coreml_free(cache->seg_coreml_ctx);
 #endif
+            free_ggml_diarization_models(cache);
             delete cache;
             return nullptr;
         }
@@ -83,6 +139,7 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 #ifdef SEGMENTATION_USE_COREML
             if (cache->seg_coreml_ctx) segmentation_coreml_free(cache->seg_coreml_ctx);
 #endif
+            free_ggml_diarization_models(cache);
             delete cache;
             return nullptr;
         }
@@ -142,6 +199,8 @@ void model_cache_free(ModelCache* cache) {
         cache->seg_coreml_ctx = nullptr;
     }
 #endif
+
+    free_ggml_diarization_models(cache);
 
     delete cache;
 }

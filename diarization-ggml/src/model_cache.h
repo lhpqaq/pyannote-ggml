@@ -3,6 +3,9 @@
 #include "plda.h"         // for diarization::PLDAModel
 #include "transcriber.h"  // for TranscriberConfig
 
+#include "../../models/segmentation-ggml/src/model.h"
+#include "../../models/embedding-ggml/src/model.h"
+
 #include <string>
 
 // Forward declarations
@@ -32,6 +35,14 @@ struct ModelCache {
     embedding_coreml_context* emb_coreml_ctx = nullptr;
     diarization::PLDAModel plda;
     bool plda_loaded = false;
+
+    // Diarization models (GGML)
+    segmentation::segmentation_model seg_model = {};
+    segmentation::segmentation_state seg_state = {};
+    bool seg_ggml_loaded = false;
+    embedding::embedding_model emb_model = {};
+    embedding::embedding_state emb_state = {};
+    bool emb_ggml_loaded = false;
 
     // Whisper
     whisper_context* whisper_ctx = nullptr;

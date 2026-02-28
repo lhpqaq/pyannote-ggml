@@ -346,11 +346,19 @@ OfflinePipelineResult offline_transcribe_with_cache(
     DiarizationResult diar_result;
 
 #if defined(SEGMENTATION_USE_COREML) && defined(EMBEDDING_USE_COREML)
-    if (!diarize_from_samples_with_models(diar_config, audio, n_samples,
-                                          cache->seg_coreml_ctx, cache->emb_coreml_ctx,
-                                          cache->plda, diar_result)) {
-        fprintf(stderr, "ERROR: offline_transcribe_with_cache: diarization failed\n");
-        return out;
+    const bool has_coreml_cache = (cache->seg_coreml_ctx != nullptr) && (cache->emb_coreml_ctx != nullptr);
+    if (has_coreml_cache) {
+        if (!diarize_from_samples_with_models(diar_config, audio, n_samples,
+                                              cache->seg_coreml_ctx, cache->emb_coreml_ctx,
+                                              cache->plda, diar_result)) {
+            fprintf(stderr, "ERROR: offline_transcribe_with_cache: diarization failed\n");
+            return out;
+        }
+    } else {
+        if (!diarize_from_samples(diar_config, audio, n_samples, diar_result)) {
+            fprintf(stderr, "ERROR: offline_transcribe_with_cache: diarization failed\n");
+            return out;
+        }
     }
 #else
     // Fallback: use path-based loading (models in cache may not be available)
