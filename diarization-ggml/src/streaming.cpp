@@ -278,7 +278,14 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
-        if (!segmentation::model_load(config.seg_model_path, state->seg_model, false)) {
+        const std::string seg_weight_backend =
+            (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+
+        if (!segmentation::model_load(config.seg_model_path,
+                                      state->seg_model,
+                                      seg_weight_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "Error: failed to load segmentation model '%s'\n",
                     config.seg_model_path.c_str());
             free_owned_models(state);
@@ -306,7 +313,11 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
-        if (!embedding::model_load(config.emb_model_path, state->emb_model, false)) {
+        if (!embedding::model_load(config.emb_model_path,
+                                   state->emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "Error: failed to load embedding model '%s'\n",
                     config.emb_model_path.c_str());
             free_owned_models(state);

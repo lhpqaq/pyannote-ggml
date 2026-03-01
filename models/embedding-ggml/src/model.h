@@ -145,6 +145,12 @@ struct embedding_state {
 /**
  * @brief Load model weights from GGUF file
  */
+bool model_load(const std::string& fname,
+                embedding_model& model,
+                const std::string& weight_backend,
+                int gpu_device,
+                bool verbose = true);
+
 bool model_load(const std::string& fname, embedding_model& model, bool verbose = true);
 
 /**

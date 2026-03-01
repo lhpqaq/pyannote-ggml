@@ -32,7 +32,14 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 
     // Load GGML segmentation model/state (optional fallback when CoreML is unavailable)
     if (!config.seg_model_path.empty()) {
-        if (!segmentation::model_load(config.seg_model_path, cache->seg_model, false)) {
+        const std::string seg_weight_backend =
+            (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+
+        if (!segmentation::model_load(config.seg_model_path,
+                                      cache->seg_model,
+                                      seg_weight_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "model_cache_load: failed to load segmentation GGML model '%s'\n",
                     config.seg_model_path.c_str());
             free_ggml_diarization_models(cache);
@@ -53,7 +60,11 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 
     // Load GGML embedding model/state (optional fallback when CoreML is unavailable)
     if (!config.emb_model_path.empty()) {
-        if (!embedding::model_load(config.emb_model_path, cache->emb_model, false)) {
+        if (!embedding::model_load(config.emb_model_path,
+                                   cache->emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "model_cache_load: failed to load embedding GGML model '%s'\n",
                     config.emb_model_path.c_str());
             free_ggml_diarization_models(cache);

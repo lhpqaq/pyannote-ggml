@@ -1,6 +1,10 @@
 #include "plda.h"
 
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 #include <ggml.h>
 #include <gguf.h>
 

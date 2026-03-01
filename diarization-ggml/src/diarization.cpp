@@ -332,7 +332,14 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     } else
 #endif
     {
-        if (!segmentation::model_load(config.seg_model_path, seg_model, false)) {
+        const std::string seg_weight_backend =
+            (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+
+        if (!segmentation::model_load(config.seg_model_path,
+                                      seg_model,
+                                      seg_weight_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "Error: failed to load segmentation model '%s'\n",
                     config.seg_model_path.c_str());
             return false;
@@ -376,7 +383,11 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
 #endif
 
     if (!use_emb_coreml) {
-        if (!embedding::model_load(config.emb_model_path, emb_model, false)) {
+        if (!embedding::model_load(config.emb_model_path,
+                                   emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "Error: failed to load embedding model '%s'\n",
                     config.emb_model_path.c_str());
             if (seg_state.sched) segmentation::state_free(seg_state);

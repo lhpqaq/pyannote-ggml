@@ -172,6 +172,12 @@ struct segmentation_state {
  * @param model Pointer to model struct to populate
  * @return true if successful, false otherwise
  */
+bool model_load(const std::string& fname,
+                segmentation_model& model,
+                const std::string& weight_backend,
+                int gpu_device,
+                bool verbose = true);
+
 bool model_load(const std::string& fname, segmentation_model& model, bool verbose = true);
 
 /**

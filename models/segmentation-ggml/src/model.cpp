@@ -2,6 +2,7 @@
 #include "sincnet.h"
 #include "lstm.h"
 #include <iostream>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <sstream>
@@ -136,7 +137,11 @@ static void report_gpu_offload_coverage_once(segmentation_state& state, struct g
 // Model Loading (Phase 2: Backend Allocation Pattern)
 // ============================================================================
 
-bool model_load(const std::string& fname, segmentation_model& model, bool verbose) {
+bool model_load(const std::string& fname,
+                segmentation_model& model,
+                const std::string& weight_backend,
+                int gpu_device,
+                bool verbose) {
     if (verbose) printf("Loading model from: %s\n", fname.c_str());
     
     // Step 1: Open GGUF with no_alloc=true (metadata only, no data allocation)
@@ -247,20 +252,35 @@ bool model_load(const std::string& fname, segmentation_model& model, bool verbos
     model.classifier_weight = get_tensor(model.ctx, "classifier.weight");
     model.classifier_bias   = get_tensor(model.ctx, "classifier.bias");
     
-    // Step 4: Allocate weight buffers on CPU backend
+    // Step 4: Allocate weight buffers on selected backend
     if (verbose) printf("\nAllocating weight buffers...\n");
-    
-    ggml_backend_t weight_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!weight_backend) {
-        fprintf(stderr, "ERROR: Failed to initialize CPU backend for weights\n");
+
+    ggml_backend_t weight_backend_handle = nullptr;
+    if (weight_backend == "cuda") {
+        char device_desc[32];
+        std::snprintf(device_desc, sizeof(device_desc), "CUDA%d", gpu_device);
+        weight_backend_handle = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, device_desc);
+        if (!weight_backend_handle) {
+            fprintf(stderr,
+                    "WARNING: Failed to initialize CUDA weight backend '%s', falling back to CPU\n",
+                    device_desc);
+        }
+    }
+
+    if (!weight_backend_handle) {
+        weight_backend_handle = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
+
+    if (!weight_backend_handle) {
+        fprintf(stderr, "ERROR: Failed to initialize backend for weights\n");
         return false;
     }
-    if (verbose) printf("  Using CPU backend for weights: %s\n", ggml_backend_name(weight_backend));
-    
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model.ctx, weight_backend);
+    if (verbose) printf("  Using backend for weights: %s\n", ggml_backend_name(weight_backend_handle));
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model.ctx, weight_backend_handle);
     if (!buf) {
         fprintf(stderr, "ERROR: Failed to allocate weight buffer\n");
-        ggml_backend_free(weight_backend);
+        ggml_backend_free(weight_backend_handle);
         return false;
     }
     
@@ -271,7 +291,7 @@ bool model_load(const std::string& fname, segmentation_model& model, bool verbos
            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
            ggml_backend_buffer_name(buf));
     
-    ggml_backend_free(weight_backend);
+    ggml_backend_free(weight_backend_handle);
     
     // Step 5: Load weight data from GGUF file
     if (verbose) printf("\nLoading weight data from file...\n");
@@ -316,6 +336,10 @@ bool model_load(const std::string& fname, segmentation_model& model, bool verbos
     if (verbose) printf("  Loaded %d tensors\n", n_tensors);
     
     return true;
+}
+
+bool model_load(const std::string& fname, segmentation_model& model, bool verbose) {
+    return model_load(fname, model, "cpu", 0, verbose);
 }
 
 void model_free(segmentation_model& model) {
@@ -633,6 +657,14 @@ bool state_init(segmentation_state& state,
         fprintf(stderr, "ERROR: Requested backend '%s' unavailable\n", backend.c_str());
         return false;
     }
+
+    if (gpu_backend && !state.backends.empty() && state.backends.front() != gpu_backend) {
+        auto it = std::find(state.backends.begin(), state.backends.end(), gpu_backend);
+        if (it != state.backends.end()) {
+            std::rotate(state.backends.begin(), it, it + 1);
+        }
+    }
+
     state.preferred_gpu = gpu_backend;
     
     // Step 2: Allocate graph metadata buffer

@@ -1,5 +1,6 @@
 #include "model.h"
 #include <iostream>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -78,7 +79,11 @@ static uint32_t get_u32_meta(struct gguf_context* ctx, const char* key, uint32_t
     return gguf_get_val_u32(ctx, key_id);
 }
 
-bool model_load(const std::string& fname, embedding_model& model, bool verbose) {
+bool model_load(const std::string& fname,
+                embedding_model& model,
+                const std::string& weight_backend,
+                int gpu_device,
+                bool verbose) {
     if (verbose) printf("Loading model from: %s\n", fname.c_str());
 
     struct gguf_init_params gguf_params = {
@@ -196,17 +201,32 @@ bool model_load(const std::string& fname, embedding_model& model, bool verbose) 
 
     if (verbose) printf("\nAllocating weight buffers...\n");
 
-    ggml_backend_t weight_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!weight_backend) {
-        fprintf(stderr, "ERROR: Failed to initialize CPU backend for weights\n");
+    ggml_backend_t weight_backend_handle = nullptr;
+    if (weight_backend == "cuda") {
+        char device_desc[32];
+        std::snprintf(device_desc, sizeof(device_desc), "CUDA%d", gpu_device);
+        weight_backend_handle = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, device_desc);
+        if (!weight_backend_handle) {
+            fprintf(stderr,
+                    "WARNING: Failed to initialize CUDA weight backend '%s', falling back to CPU\n",
+                    device_desc);
+        }
+    }
+
+    if (!weight_backend_handle) {
+        weight_backend_handle = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    }
+
+    if (!weight_backend_handle) {
+        fprintf(stderr, "ERROR: Failed to initialize backend for weights\n");
         return false;
     }
-    if (verbose) printf("  Using CPU backend for weights: %s\n", ggml_backend_name(weight_backend));
+    if (verbose) printf("  Using backend for weights: %s\n", ggml_backend_name(weight_backend_handle));
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model.ctx, weight_backend);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model.ctx, weight_backend_handle);
     if (!buf) {
         fprintf(stderr, "ERROR: Failed to allocate weight buffer\n");
-        ggml_backend_free(weight_backend);
+        ggml_backend_free(weight_backend_handle);
         return false;
     }
 
@@ -217,7 +237,7 @@ bool model_load(const std::string& fname, embedding_model& model, bool verbose) 
            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
            ggml_backend_buffer_name(buf));
 
-    ggml_backend_free(weight_backend);
+    ggml_backend_free(weight_backend_handle);
 
     if (verbose) printf("\nLoading weight data from file...\n");
 
@@ -261,6 +281,10 @@ bool model_load(const std::string& fname, embedding_model& model, bool verbose) 
     if (verbose) printf("  Loaded %d tensors\n", n_tensors);
 
     return true;
+}
+
+bool model_load(const std::string& fname, embedding_model& model, bool verbose) {
+    return model_load(fname, model, "cpu", 0, verbose);
 }
 
 void model_free(embedding_model& model) {
@@ -705,6 +729,14 @@ bool state_init(embedding_state& state,
         fprintf(stderr, "ERROR: Requested backend '%s' unavailable\n", backend.c_str());
         return false;
     }
+
+    if (gpu_backend && !state.backends.empty() && state.backends.front() != gpu_backend) {
+        auto it = std::find(state.backends.begin(), state.backends.end(), gpu_backend);
+        if (it != state.backends.end()) {
+            std::rotate(state.backends.begin(), it, it + 1);
+        }
+    }
+
     state.preferred_gpu = gpu_backend;
 
     size_t meta_size = ggml_tensor_overhead() * MAX_GRAPH_NODES + ggml_graph_overhead_custom(MAX_GRAPH_NODES, false);

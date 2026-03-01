@@ -69,6 +69,9 @@ target_link_libraries(diarization-lib PUBLIC
 if(APPLE)
     target_link_libraries(diarization-lib PUBLIC "-framework Accelerate")
     target_compile_definitions(diarization-lib PUBLIC ACCELERATE_NEW_LAPACK)
+else()
+    find_package(BLAS REQUIRED)
+    target_link_libraries(diarization-lib PUBLIC ${BLAS_LIBRARIES})
 endif()
 
 # CoreML support
