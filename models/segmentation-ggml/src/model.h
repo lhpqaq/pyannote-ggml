@@ -114,6 +114,7 @@ struct segmentation_model {
     struct ggml_context* ctx = nullptr;                     // Context holding weight tensor metadata
     struct gguf_context* gguf_ctx = nullptr;                // GGUF file context
     std::vector<ggml_backend_buffer_t> weight_buffers;      // Backend buffers holding weight data
+    std::vector<ggml_backend_t> weight_backends;            // Keep backend alive for weight buffers
 };
 
 /**

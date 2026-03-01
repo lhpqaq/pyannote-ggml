@@ -352,7 +352,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             segmentation::model_free(seg_model);
             return false;
         }
-        segmentation::state_set_backend_stats(seg_state, true);
+        segmentation::state_set_backend_stats(seg_state, false);
     }
     
     t_stage_end = Clock::now();
@@ -383,9 +383,11 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
 #endif
 
     if (!use_emb_coreml) {
+        const std::string emb_weight_backend = config.ggml_backend;
+
         if (!embedding::model_load(config.emb_model_path,
                                    emb_model,
-                                   config.ggml_backend,
+                                   emb_weight_backend,
                                    config.ggml_gpu_device,
                                    false)) {
             fprintf(stderr, "Error: failed to load embedding model '%s'\n",
@@ -404,7 +406,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             if (seg_model.ctx) segmentation::model_free(seg_model);
             return false;
         }
-        embedding::state_set_backend_stats(emb_state, true);
+        embedding::state_set_backend_stats(emb_state, false);
     }
     
     t_stage_end = Clock::now();

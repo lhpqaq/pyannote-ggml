@@ -231,13 +231,12 @@ bool model_load(const std::string& fname,
     }
 
     model.weight_buffers.push_back(buf);
+    model.weight_backends.push_back(weight_backend_handle);
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     if (verbose) printf("  Weight buffer: %.2f MB (%s)\n",
            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
            ggml_backend_buffer_name(buf));
-
-    ggml_backend_free(weight_backend_handle);
 
     if (verbose) printf("\nLoading weight data from file...\n");
 
@@ -292,6 +291,11 @@ void model_free(embedding_model& model) {
         ggml_backend_buffer_free(model.weight_buffers[i]);
     }
     model.weight_buffers.clear();
+
+    for (size_t i = 0; i < model.weight_backends.size(); i++) {
+        ggml_backend_free(model.weight_backends[i]);
+    }
+    model.weight_backends.clear();
 
     if (model.ctx) {
         ggml_free(model.ctx);
@@ -628,7 +632,9 @@ struct ggml_tensor* model_forward(
     // bessel = T8 / (T8 - 1)
     struct ggml_tensor* bessel = ggml_div(ctx, t8_scalar, t8m1_scalar);
     struct ggml_tensor* var_unbiased = ggml_mul(ctx, var_vec, bessel);
-    struct ggml_tensor* var_unbiased_stable = ggml_add(ctx, var_unbiased, var_eps);
+    // CUDA path can produce tiny negative variance from FP roundoff; clamp before sqrt
+    struct ggml_tensor* var_unbiased_nonneg = ggml_clamp(ctx, var_unbiased, 0.0f, INFINITY);
+    struct ggml_tensor* var_unbiased_stable = ggml_add(ctx, var_unbiased_nonneg, var_eps);
     std_vec = ggml_sqrt(ctx, var_unbiased_stable);
 
     // Concatenate mean + std: [feat_dim, 1] + [feat_dim, 1] → [2*feat_dim, 1]

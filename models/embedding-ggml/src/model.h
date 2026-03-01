@@ -103,6 +103,7 @@ struct embedding_model {
     struct ggml_context* ctx = nullptr;
     struct gguf_context* gguf_ctx = nullptr;
     std::vector<ggml_backend_buffer_t> weight_buffers;
+    std::vector<ggml_backend_t> weight_backends;
 };
 
 /**

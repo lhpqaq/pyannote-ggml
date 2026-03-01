@@ -60,9 +60,11 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 
     // Load GGML embedding model/state (optional fallback when CoreML is unavailable)
     if (!config.emb_model_path.empty()) {
+        const std::string emb_weight_backend = config.ggml_backend;
+
         if (!embedding::model_load(config.emb_model_path,
                                    cache->emb_model,
-                                   config.ggml_backend,
+                                   emb_weight_backend,
                                    config.ggml_gpu_device,
                                    false)) {
             fprintf(stderr, "model_cache_load: failed to load embedding GGML model '%s'\n",

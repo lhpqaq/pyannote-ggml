@@ -313,9 +313,11 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
+        const std::string emb_weight_backend = config.ggml_backend;
+
         if (!embedding::model_load(config.emb_model_path,
                                    state->emb_model,
-                                   config.ggml_backend,
+                                   emb_weight_backend,
                                    config.ggml_gpu_device,
                                    false)) {
             fprintf(stderr, "Error: failed to load embedding model '%s'\n",

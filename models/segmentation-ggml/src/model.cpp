@@ -285,13 +285,12 @@ bool model_load(const std::string& fname,
     }
     
     model.weight_buffers.push_back(buf);
+    model.weight_backends.push_back(weight_backend_handle);
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     
     if (verbose) printf("  Weight buffer: %.2f MB (%s)\n",
            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
            ggml_backend_buffer_name(buf));
-    
-    ggml_backend_free(weight_backend_handle);
     
     // Step 5: Load weight data from GGUF file
     if (verbose) printf("\nLoading weight data from file...\n");
@@ -347,6 +346,11 @@ void model_free(segmentation_model& model) {
         ggml_backend_buffer_free(model.weight_buffers[i]);
     }
     model.weight_buffers.clear();
+
+    for (size_t i = 0; i < model.weight_backends.size(); i++) {
+        ggml_backend_free(model.weight_backends[i]);
+    }
+    model.weight_backends.clear();
     
     if (model.ctx) {
         ggml_free(model.ctx);

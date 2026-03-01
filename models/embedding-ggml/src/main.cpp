@@ -238,6 +238,8 @@ int main(int argc, char** argv) {
     bool run_test_inference = false;
     bool run_benchmark = false;
     std::string audio_path;
+    std::string backend = "auto";
+    int gpu_device = 0;
     std::string coreml_path;
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -251,6 +253,10 @@ int main(int argc, char** argv) {
             run_benchmark = true;
         } else if (arg == "--audio" && i + 1 < argc) {
             audio_path = argv[++i];
+        } else if (arg == "--backend" && i + 1 < argc) {
+            backend = argv[++i];
+        } else if (arg == "--gpu-device" && i + 1 < argc) {
+            gpu_device = std::stoi(argv[++i]);
         } else if (arg == "--coreml" && i + 1 < argc) {
             coreml_path = argv[++i];
         }
@@ -276,7 +282,7 @@ int main(int argc, char** argv) {
     embedding::embedding_model model;
 
     std::cout << "\nLoading model..." << std::endl;
-    if (!embedding::model_load(model_path, model)) {
+    if (!embedding::model_load(model_path, model, backend, gpu_device, true)) {
         std::cerr << "Error: Failed to load model from " << model_path << std::endl;
         return 1;
     }
@@ -365,7 +371,7 @@ int main(int argc, char** argv) {
         {
             printf("\nInitializing inference state...\n");
             embedding::embedding_state state;
-            if (!embedding::state_init(state, model)) {
+            if (!embedding::state_init(state, model, backend, gpu_device, true)) {
                 fprintf(stderr, "ERROR: Failed to initialize inference state\n");
                 embedding::model_free(model);
                 return 1;
@@ -472,7 +478,7 @@ int main(int argc, char** argv) {
         printf("  Fbank shape: [%d, %d]\n", fbank.num_frames, fbank.num_bins);
 
         embedding::embedding_state state;
-        if (!embedding::state_init(state, model)) {
+        if (!embedding::state_init(state, model, backend, gpu_device, true)) {
             fprintf(stderr, "ERROR: Failed to initialize inference state\n");
             embedding::model_free(model);
             return 1;
