@@ -352,7 +352,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             segmentation::model_free(seg_model);
             return false;
         }
-        segmentation::state_set_backend_stats(seg_state, false);
+        segmentation::state_set_backend_stats(seg_state, true);
     }
     
     t_stage_end = Clock::now();
@@ -406,7 +406,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             if (seg_model.ctx) segmentation::model_free(seg_model);
             return false;
         }
-        embedding::state_set_backend_stats(emb_state, false);
+        embedding::state_set_backend_stats(emb_state, true);
     }
     
     t_stage_end = Clock::now();

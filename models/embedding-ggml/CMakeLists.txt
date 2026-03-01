@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(EMBEDDING_COREML "Enable CoreML acceleration" OFF)
 
+if(APPLE)
+    set(GGML_METAL_DEFAULT ON)
+else()
+    set(GGML_METAL_DEFAULT OFF)
+endif()
+option(GGML_METAL "Enable Metal backend for GPU acceleration" ${GGML_METAL_DEFAULT})
+
 # Add GGML as subdirectory (guarded for multi-project builds)
 if(NOT TARGET ggml)
     add_subdirectory(../../ggml ${CMAKE_CURRENT_BINARY_DIR}/ggml)
@@ -35,6 +42,17 @@ target_link_libraries(embedding-core PUBLIC ggml kaldi-native-fbank-core)
 if(APPLE)
     target_link_libraries(embedding-core PUBLIC "-framework Accelerate")
     target_compile_definitions(embedding-core PUBLIC ACCELERATE_NEW_LAPACK)
+endif()
+
+if(GGML_METAL)
+    if(APPLE)
+        target_compile_definitions(embedding-core PUBLIC GGML_USE_METAL)
+        message(STATUS "Metal backend enabled for embedding-ggml")
+    else()
+        message(WARNING "GGML_METAL requested for embedding-ggml on non-Apple platform; ignored")
+    endif()
+else()
+    message(STATUS "Metal backend disabled for embedding-ggml")
 endif()
 
 # --- Executable ---

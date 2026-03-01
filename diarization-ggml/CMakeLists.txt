@@ -8,6 +8,17 @@ option(SEGMENTATION_COREML "Enable CoreML acceleration for segmentation" OFF)
 option(WHISPER_COREML "Enable CoreML for Whisper transcription" OFF)
 option(DIARIZATION_STATIC "Build all dependencies as static libraries" OFF)
 
+if(APPLE)
+    set(GGML_METAL_DEFAULT ON)
+else()
+    set(GGML_METAL_DEFAULT OFF)
+endif()
+option(GGML_METAL "Enable Metal backend for GPU acceleration" ${GGML_METAL_DEFAULT})
+
+if(GGML_METAL AND NOT APPLE)
+    message(WARNING "GGML_METAL is enabled on non-Apple platform; Metal backend will be unavailable")
+endif()
+
 # Whisper.cpp integration (adds ggml as part of its build, so ggml guard below will skip)
 if(NOT TARGET whisper)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)

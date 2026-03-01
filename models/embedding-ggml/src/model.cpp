@@ -680,6 +680,17 @@ bool state_init(embedding_state& state,
     const bool want_metal = backend == "metal" || backend == "auto";
     const bool want_cuda = backend == "cuda" || backend == "auto";
 
+#ifdef GGML_USE_METAL
+    constexpr bool metal_compiled = true;
+#else
+    constexpr bool metal_compiled = false;
+#endif
+
+    if (backend == "metal" && !metal_compiled) {
+        fprintf(stderr, "ERROR: Metal backend requested but this binary was built without Metal support (GGML_USE_METAL)\n");
+        return false;
+    }
+
     ggml_backend_t cpu_primary = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu_primary) {
         fprintf(stderr, "ERROR: Failed to initialize CPU backend\n");
@@ -694,7 +705,7 @@ bool state_init(embedding_state& state,
             state.backends.push_back(metal_backend);
             if (verbose) printf("  Using GPU backend: %s\n", ggml_backend_name(metal_backend));
         } else if (backend == "metal") {
-            fprintf(stderr, "ERROR: Failed to initialize Metal backend\n");
+            fprintf(stderr, "ERROR: Failed to initialize Metal backend (check macOS runtime and GGML_METAL build option)\n");
             return false;
         }
     }
