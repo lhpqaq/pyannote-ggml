@@ -92,6 +92,9 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
         return 0;
     }
 
+    const char* dbg_assign = std::getenv("DIARIZATION_SEG_DEBUG_ASSIGN");
+    const bool dbg_assign_enabled = dbg_assign && std::strcmp(dbg_assign, "1") == 0;
+
     int assigned = 0;
     const int n_nodes = ggml_graph_n_nodes(graph);
     for (int i = 0; i < n_nodes; ++i) {
@@ -126,7 +129,6 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
         const bool mode_all = state.experimental_gpu_partition_mode == "all";
         const bool mode_linear = state.experimental_gpu_partition_mode == "linear";
         const bool mode_classifier = state.experimental_gpu_partition_mode == "classifier";
-        const bool mode_linear_only = state.experimental_gpu_partition_mode == "linear-only";
         const char* node_name = node->name;
         const bool is_classifier_mm = node_name && std::strcmp(node_name, "classifier_mm") == 0;
         const bool is_linear_mm = node_name &&
@@ -137,12 +139,44 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
             if (!is_classifier_mm) {
                 continue;
             }
-        } else if (mode_linear) {
-            if (!is_classifier_mm && !is_linear_mm) {
+
+            // Extra safety in classifier-only mode: gate on expected classifier matmul layout
+            // to avoid accidentally offloading similarly-shaped matmuls.
+            if (!node->src[0] || !node->src[1]) {
+                if (dbg_assign_enabled) {
+                    fprintf(stderr, "[seg-assign] skip classifier_mm: missing src tensors\n");
+                }
                 continue;
             }
-        } else if (mode_linear_only) {
-            if (!is_linear_mm) {
+
+            // Expected classifier tensors:
+            // src0 = classifier.weight [128, 7], src1 = x_2d [128, T], out = [7, T]
+            const bool classifier_shape_ok =
+                node->src[0]->ne[0] == 128 &&
+                node->src[0]->ne[1] == 7 &&
+                node->src[1]->ne[0] == 128 &&
+                node->ne[0] == 7;
+            if (!classifier_shape_ok) {
+                if (dbg_assign_enabled) {
+                    fprintf(stderr,
+                            "[seg-assign] skip classifier_mm: unexpected shape out=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
+                            (long long) node->ne[0],
+                            (long long) node->ne[1],
+                            (long long) node->ne[2],
+                            (long long) node->ne[3],
+                            (long long) node->src[0]->ne[0],
+                            (long long) node->src[0]->ne[1],
+                            (long long) node->src[0]->ne[2],
+                            (long long) node->src[0]->ne[3],
+                            (long long) node->src[1]->ne[0],
+                            (long long) node->src[1]->ne[1],
+                            (long long) node->src[1]->ne[2],
+                            (long long) node->src[1]->ne[3]);
+                }
+                continue;
+            }
+        } else if (mode_linear) {
+            if (!is_classifier_mm && !is_linear_mm) {
                 continue;
             }
         } else if (!mode_all) {
@@ -150,24 +184,39 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
         }
 
         if (!ggml_backend_supports_op(state.preferred_gpu, node)) {
+            if (dbg_assign_enabled) {
+                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
+                fprintf(stderr, "[seg-assign] skip %s: gpu backend does not support op\n", node_name_dbg);
+            }
             continue;
         }
 
         // Strict safety for custom-op boundary: only offload matmul when both inputs
         // are plain contiguous tensors to avoid layout-dependent mismatch.
         if (!node->src[0] || !node->src[1]) {
+            if (dbg_assign_enabled) {
+                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
+                fprintf(stderr, "[seg-assign] skip %s: missing src0/src1\n", node_name_dbg);
+            }
             continue;
         }
         if (!ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node->src[1])) {
+            if (dbg_assign_enabled) {
+                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
+                fprintf(stderr,
+                        "[seg-assign] skip %s: non-contiguous src (src0=%d src1=%d)\n",
+                        node_name_dbg,
+                        ggml_is_contiguous(node->src[0]) ? 1 : 0,
+                        ggml_is_contiguous(node->src[1]) ? 1 : 0);
+            }
             continue;
         }
 
         ggml_backend_sched_set_tensor_backend(state.sched, node, state.preferred_gpu);
-        const char* dbg = std::getenv("DIARIZATION_SEG_DEBUG_ASSIGN");
-        if (dbg && std::strcmp(dbg, "1") == 0) {
+        if (dbg_assign_enabled) {
             const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
             fprintf(stderr,
-                    "[seg-assign] gpu <- %s op=%d ne=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld]\n",
+                    "[seg-assign] gpu <- %s op=%d ne=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
                     node_name_dbg,
                     (int) node->op,
                     (long long) node->ne[0],
@@ -177,7 +226,11 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
                     node->src[0] ? (long long) node->src[0]->ne[0] : -1LL,
                     node->src[0] ? (long long) node->src[0]->ne[1] : -1LL,
                     node->src[0] ? (long long) node->src[0]->ne[2] : -1LL,
-                    node->src[0] ? (long long) node->src[0]->ne[3] : -1LL);
+                    node->src[0] ? (long long) node->src[0]->ne[3] : -1LL,
+                    node->src[1] ? (long long) node->src[1]->ne[0] : -1LL,
+                    node->src[1] ? (long long) node->src[1]->ne[1] : -1LL,
+                    node->src[1] ? (long long) node->src[1]->ne[2] : -1LL,
+                    node->src[1] ? (long long) node->src[1]->ne[3] : -1LL);
         }
         assigned++;
     }
@@ -239,6 +292,24 @@ static void dump_tensor_binary_from_tensor(struct ggml_tensor* tensor,
     out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)nbytes);
 }
 
+static void maybe_dump_tensor_meta(struct ggml_tensor* tensor, const char* tag) {
+    const char* dbg = std::getenv("DIARIZATION_SEG_DEBUG_TENSOR_META");
+    if (!dbg || std::strcmp(dbg, "1") != 0 || !tensor || !tag) {
+        return;
+    }
+
+    fprintf(stderr,
+            "[seg-meta] %s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contiguous=%d\n",
+            tag,
+            ggml_type_name(tensor->type),
+            (long long) tensor->ne[0],
+            (long long) tensor->ne[1],
+            (long long) tensor->ne[2],
+            (long long) tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
+            ggml_is_contiguous(tensor) ? 1 : 0);
+}
+
 static void dump_selected_graph_nodes(struct ggml_cgraph* graph, const char* path_prefix, int infer_index) {
     if (!graph || !path_prefix) {
         return;
@@ -261,6 +332,31 @@ static void dump_selected_graph_nodes(struct ggml_cgraph* graph, const char* pat
         const char* node_name = (node->name && node->name[0]) ? node->name : "unnamed_mm";
         std::snprintf(safe_name, sizeof(safe_name), "mm_%02d_%s", i, node_name);
         dump_tensor_binary_from_tensor(node, safe_name, path_prefix, infer_index);
+    }
+}
+
+static void dump_classifier_mm_inputs(struct ggml_cgraph* graph, const char* path_prefix, int infer_index) {
+    if (!graph || !path_prefix) {
+        return;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node || node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        if (!node->name || std::strcmp(node->name, "classifier_mm") != 0) {
+            continue;
+        }
+
+        if (node->src[0]) {
+            dump_tensor_binary_from_tensor(node->src[0], "classifier_mm_src0", path_prefix, infer_index);
+        }
+        if (node->src[1]) {
+            dump_tensor_binary_from_tensor(node->src[1], "classifier_mm_src1", path_prefix, infer_index);
+        }
+        return;
     }
 }
 
@@ -933,6 +1029,7 @@ static struct ggml_tensor* linear_forward(
     struct ggml_tensor* x_t = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_t = ggml_cont(ctx, x_t);
     struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
+    x_2d = ggml_cont(ctx, x_2d);
     
     struct ggml_tensor* y_2d = ggml_mul_mat(ctx, weight, x_2d);
     if (mm_name) {
@@ -957,13 +1054,24 @@ static struct ggml_tensor* classifier_forward(
     int64_t seq_len = x->ne[0];
     int64_t input_dim = x->ne[1];
     int64_t num_classes = weight->ne[1];
+
+    maybe_dump_tensor_meta(x, "classifier_in_x");
+    maybe_dump_tensor_meta(weight, "classifier_weight");
+    maybe_dump_tensor_meta(bias, "classifier_bias");
     
     struct ggml_tensor* x_t = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_t = ggml_cont(ctx, x_t);
+    maybe_dump_tensor_meta(x_t, "classifier_x_t");
+
     struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
-    
+    x_2d = ggml_cont(ctx, x_2d);
+    maybe_dump_tensor_meta(x_2d, "classifier_x_2d");
+
+    maybe_dump_tensor_meta(weight, "classifier_weight_used");
+
     struct ggml_tensor* logits_2d = ggml_mul_mat(ctx, weight, x_2d);
     ggml_set_name(logits_2d, "classifier_mm");
+    maybe_dump_tensor_meta(logits_2d, "classifier_logits_2d");
     logits_2d = ggml_add(ctx, logits_2d, bias);
     
     struct ggml_tensor* probs = ggml_soft_max(ctx, logits_2d);
@@ -1178,6 +1286,8 @@ bool model_infer(
             dump_tensor_binary(graph, "linear2_mm", dump_dir, state.infer_call_index);
             dump_tensor_binary(graph, "classifier_mm", dump_dir, state.infer_call_index);
             dump_tensor_binary(graph, "classifier_out", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "lstm_out_cont", dump_dir, state.infer_call_index);
+            dump_classifier_mm_inputs(graph, dump_dir, state.infer_call_index);
             dump_selected_graph_nodes(graph, dump_dir, state.infer_call_index);
 
             char dump_path[1024];

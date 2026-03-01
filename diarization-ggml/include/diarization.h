@@ -14,6 +14,7 @@ struct DiarizationConfig {
     std::string dump_stage;  // empty = none
     std::string ggml_backend = "auto"; // auto | cpu | metal | cuda
     int ggml_gpu_device = 0;
+    bool bypass_embeddings = false;
 };
 
 struct DiarizationResult {
