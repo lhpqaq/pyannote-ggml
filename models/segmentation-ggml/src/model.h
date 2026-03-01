@@ -154,6 +154,9 @@ struct segmentation_state {
     int last_nodes_gpu = 0;
     int last_nodes_cpu = 0;
     bool printed_gpu_coverage = false;
+    bool experimental_gpu_partition = false;
+    std::string experimental_gpu_partition_mode = "off";
+    int infer_call_index = 0;
 };
 
 // ============================================================================

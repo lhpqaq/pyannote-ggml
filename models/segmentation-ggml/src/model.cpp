@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <sstream>
 #include <chrono>
 #include <ggml-alloc.h>
@@ -86,9 +88,180 @@ static bool verify_tensor_shape(struct ggml_tensor* tensor, const char* name,
 }
 
 static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml_cgraph* graph) {
-    (void) state;
-    (void) graph;
-    return 0;
+    if (!state.sched || !state.preferred_gpu || !graph) {
+        return 0;
+    }
+
+    int assigned = 0;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node) {
+            continue;
+        }
+
+        if (!state.experimental_gpu_partition) {
+            continue;
+        }
+
+        // Experimental CoreML-like split idea: keep sensitive/custom parts on CPU,
+        // offload only selected matmul blocks.
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        // Any matmul directly consuming 160000-sample waveform path is part of SincNet front-end.
+        // Keep it on CPU for stability in CUDA backend.
+        bool touches_waveform = false;
+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+            if (node->src[si] && node->src[si]->ne[0] == 160000) {
+                touches_waveform = true;
+                break;
+            }
+        }
+        if (touches_waveform) {
+            continue;
+        }
+
+        const bool mode_all = state.experimental_gpu_partition_mode == "all";
+        const bool mode_linear = state.experimental_gpu_partition_mode == "linear";
+        const bool mode_classifier = state.experimental_gpu_partition_mode == "classifier";
+        const bool mode_linear_only = state.experimental_gpu_partition_mode == "linear-only";
+        const char* node_name = node->name;
+        const bool is_classifier_mm = node_name && std::strcmp(node_name, "classifier_mm") == 0;
+        const bool is_linear_mm = node_name &&
+                                  (std::strcmp(node_name, "linear1_mm") == 0 ||
+                                   std::strcmp(node_name, "linear2_mm") == 0);
+
+        if (mode_classifier) {
+            if (!is_classifier_mm) {
+                continue;
+            }
+        } else if (mode_linear) {
+            if (!is_classifier_mm && !is_linear_mm) {
+                continue;
+            }
+        } else if (mode_linear_only) {
+            if (!is_linear_mm) {
+                continue;
+            }
+        } else if (!mode_all) {
+            continue;
+        }
+
+        if (!ggml_backend_supports_op(state.preferred_gpu, node)) {
+            continue;
+        }
+
+        // Strict safety for custom-op boundary: only offload matmul when both inputs
+        // are plain contiguous tensors to avoid layout-dependent mismatch.
+        if (!node->src[0] || !node->src[1]) {
+            continue;
+        }
+        if (!ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node->src[1])) {
+            continue;
+        }
+
+        ggml_backend_sched_set_tensor_backend(state.sched, node, state.preferred_gpu);
+        const char* dbg = std::getenv("DIARIZATION_SEG_DEBUG_ASSIGN");
+        if (dbg && std::strcmp(dbg, "1") == 0) {
+            const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
+            fprintf(stderr,
+                    "[seg-assign] gpu <- %s op=%d ne=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld]\n",
+                    node_name_dbg,
+                    (int) node->op,
+                    (long long) node->ne[0],
+                    (long long) node->ne[1],
+                    (long long) node->ne[2],
+                    (long long) node->ne[3],
+                    node->src[0] ? (long long) node->src[0]->ne[0] : -1LL,
+                    node->src[0] ? (long long) node->src[0]->ne[1] : -1LL,
+                    node->src[0] ? (long long) node->src[0]->ne[2] : -1LL,
+                    node->src[0] ? (long long) node->src[0]->ne[3] : -1LL);
+        }
+        assigned++;
+    }
+
+    return assigned;
+}
+
+static void dump_tensor_binary(struct ggml_cgraph* graph, const char* tensor_name, const char* path_prefix, int infer_index) {
+    if (!graph || !tensor_name || !path_prefix) {
+        return;
+    }
+
+    struct ggml_tensor* tensor = ggml_graph_get_tensor(graph, tensor_name);
+    if (!tensor) {
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> bytes(nbytes);
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, nbytes);
+
+    char dump_path[1024];
+    std::snprintf(dump_path, sizeof(dump_path), "%s/seg_%s_%04d.bin", path_prefix, tensor_name, infer_index);
+
+    std::ofstream out(dump_path, std::ios::binary);
+    if (!out.good()) {
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)nbytes);
+}
+
+static void dump_tensor_binary_from_tensor(struct ggml_tensor* tensor,
+                                           const char* tag,
+                                           const char* path_prefix,
+                                           int infer_index) {
+    if (!tensor || !tag || !path_prefix) {
+        return;
+    }
+
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) {
+        return;
+    }
+
+    std::vector<uint8_t> bytes(nbytes);
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, nbytes);
+
+    char dump_path[1024];
+    std::snprintf(dump_path, sizeof(dump_path), "%s/seg_%s_%04d.bin", path_prefix, tag, infer_index);
+
+    std::ofstream out(dump_path, std::ios::binary);
+    if (!out.good()) {
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)nbytes);
+}
+
+static void dump_selected_graph_nodes(struct ggml_cgraph* graph, const char* path_prefix, int infer_index) {
+    if (!graph || !path_prefix) {
+        return;
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node || node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+
+        // dump only small head matmuls to avoid huge files
+        const int64_t out_ch = node->ne[1];
+        if (out_ch != 7 && out_ch != 128) {
+            continue;
+        }
+
+        char safe_name[80];
+        const char* node_name = (node->name && node->name[0]) ? node->name : "unnamed_mm";
+        std::snprintf(safe_name, sizeof(safe_name), "mm_%02d_%s", i, node_name);
+        dump_tensor_binary_from_tensor(node, safe_name, path_prefix, infer_index);
+    }
 }
 
 static void report_gpu_offload_coverage_once(segmentation_state& state, struct ggml_cgraph* graph) {
@@ -750,7 +923,8 @@ static struct ggml_tensor* linear_forward(
     struct ggml_context* ctx,
     struct ggml_tensor* x,
     struct ggml_tensor* weight,
-    struct ggml_tensor* bias) {
+    struct ggml_tensor* bias,
+    const char* mm_name) {
     
     int64_t seq_len = x->ne[0];
     int64_t input_dim = x->ne[1];
@@ -761,6 +935,9 @@ static struct ggml_tensor* linear_forward(
     struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
     
     struct ggml_tensor* y_2d = ggml_mul_mat(ctx, weight, x_2d);
+    if (mm_name) {
+        ggml_set_name(y_2d, mm_name);
+    }
     y_2d = ggml_add(ctx, y_2d, bias);
     y_2d = ggml_leaky_relu(ctx, y_2d, 0.01f, true);
     
@@ -786,6 +963,7 @@ static struct ggml_tensor* classifier_forward(
     struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
     
     struct ggml_tensor* logits_2d = ggml_mul_mat(ctx, weight, x_2d);
+    ggml_set_name(logits_2d, "classifier_mm");
     logits_2d = ggml_add(ctx, logits_2d, bias);
     
     struct ggml_tensor* probs = ggml_soft_max(ctx, logits_2d);
@@ -818,14 +996,21 @@ struct ggml_tensor* model_forward(
         fprintf(stderr, "ERROR: LSTM forward pass failed\n");
         return nullptr;
     }
+
+    // Custom LSTM op outputs CPU-written tensors; force a contiguous staging tensor
+    // before optional GPU head offload to avoid backend handoff ambiguity.
+    lstm_out = ggml_cont(ctx, lstm_out);
+    ggml_set_name(lstm_out, "lstm_out_cont");
     
     struct ggml_tensor* linear1_out = linear_forward(ctx, lstm_out,
                                                      model.linear_weight[0],
-                                                     model.linear_bias[0]);
-    
+                                                     model.linear_bias[0],
+                                                     "linear1_mm");
+
     struct ggml_tensor* linear2_out = linear_forward(ctx, linear1_out,
                                                      model.linear_weight[1],
-                                                     model.linear_bias[1]);
+                                                     model.linear_bias[1],
+                                                     "linear2_mm");
     
     struct ggml_tensor* output = classifier_forward(ctx, linear2_out,
                                                     model.classifier_weight,
@@ -978,8 +1163,40 @@ bool model_infer(
     size_t requested_bytes = output_size * sizeof(float);
     size_t copy_bytes = (output_bytes < requested_bytes) ? output_bytes : requested_bytes;
     ggml_backend_tensor_get(output_tensor, output, 0, copy_bytes);
-    
+
+    if (const char* dump_dir = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_DIR")) {
+        int dump_max = 1;
+        if (const char* dump_max_env = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_MAX")) {
+            int parsed = std::atoi(dump_max_env);
+            if (parsed > 0) {
+                dump_max = parsed;
+            }
+        }
+
+        if (state.infer_call_index < dump_max) {
+            dump_tensor_binary(graph, "linear1_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "linear2_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "classifier_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "classifier_out", dump_dir, state.infer_call_index);
+            dump_selected_graph_nodes(graph, dump_dir, state.infer_call_index);
+
+            char dump_path[1024];
+            std::snprintf(dump_path,
+                          sizeof(dump_path),
+                          "%s/seg_logits_%s_%04d.bin",
+                          dump_dir,
+                          state.experimental_gpu_partition_mode.c_str(),
+                          state.infer_call_index);
+            std::ofstream out(dump_path, std::ios::binary);
+            if (out.good()) {
+                out.write(reinterpret_cast<const char*>(output), (std::streamsize)copy_bytes);
+            }
+        }
+    }
+
     ggml_backend_sched_reset(state.sched);
+
+    state.infer_call_index++;
     
     auto prof_end = std::chrono::high_resolution_clock::now();
     

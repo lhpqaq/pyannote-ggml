@@ -9,6 +9,8 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 static void free_ggml_diarization_models(ModelCache* cache) {
     if (!cache) {
@@ -32,8 +34,12 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
 
     // Load GGML segmentation model/state (optional fallback when CoreML is unavailable)
     if (!config.seg_model_path.empty()) {
-        const std::string seg_weight_backend =
+        std::string seg_weight_backend =
             (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+        if (const char* wb = std::getenv("DIARIZATION_SEG_WEIGHT_BACKEND"); wb && wb[0]) {
+            seg_weight_backend = wb;
+            fprintf(stderr, "[backend] segmentation weight backend override=%s\n", seg_weight_backend.c_str());
+        }
 
         if (!segmentation::model_load(config.seg_model_path,
                                       cache->seg_model,
@@ -54,6 +60,20 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
             free_ggml_diarization_models(cache);
             delete cache;
             return nullptr;
+        }
+        const bool seg_stats_ok = (config.ggml_backend != "cuda");
+        segmentation::state_set_backend_stats(cache->seg_state, seg_stats_ok);
+        if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
+            std::string mode = m;
+            if (mode == "classifier" || mode == "linear" || mode == "linear-only" || mode == "all") {
+                cache->seg_state.experimental_gpu_partition = true;
+                cache->seg_state.experimental_gpu_partition_mode = mode;
+                fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());
+            }
+        } else if (const char* v = std::getenv("DIARIZATION_SEG_GPU_PARTITION"); v && std::strcmp(v, "1") == 0) {
+            cache->seg_state.experimental_gpu_partition = true;
+            cache->seg_state.experimental_gpu_partition_mode = "linear";
+            fprintf(stderr, "[backend] segmentation experimental GPU partition mode=linear\n");
         }
         cache->seg_ggml_loaded = true;
     }

@@ -80,4 +80,17 @@ else
     echo "  output:  stdout"
 fi
 
+if [ -n "${SEG_GPU_PARTITION_MODE:-}" ]; then
+    case "$SEG_GPU_PARTITION_MODE" in
+        classifier|linear|linear-only|all)
+            export DIARIZATION_SEG_GPU_PARTITION_MODE="$SEG_GPU_PARTITION_MODE"
+            echo "  seg-gpu-partition: $SEG_GPU_PARTITION_MODE"
+            ;;
+        *)
+            echo "Error: SEG_GPU_PARTITION_MODE must be classifier|linear|linear-only|all" >&2
+            exit 1
+            ;;
+    esac
+fi
+
 "${CMD[@]}"

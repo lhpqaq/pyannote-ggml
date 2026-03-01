@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -278,8 +279,12 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
-        const std::string seg_weight_backend =
+        std::string seg_weight_backend =
             (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+        if (const char* wb = std::getenv("DIARIZATION_SEG_WEIGHT_BACKEND"); wb && wb[0]) {
+            seg_weight_backend = wb;
+            fprintf(stderr, "[backend] segmentation weight backend override=%s\n", seg_weight_backend.c_str());
+        }
 
         if (!segmentation::model_load(config.seg_model_path,
                                       state->seg_model,
@@ -300,6 +305,20 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             free_owned_models(state);
             delete state;
             return nullptr;
+        }
+        const bool seg_stats_ok = (config.ggml_backend != "cuda");
+        segmentation::state_set_backend_stats(state->seg_state, seg_stats_ok);
+        if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
+            std::string mode = m;
+            if (mode == "classifier" || mode == "linear" || mode == "linear-only" || mode == "all") {
+                state->seg_state.experimental_gpu_partition = true;
+                state->seg_state.experimental_gpu_partition_mode = mode;
+                fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());
+            }
+        } else if (const char* v = std::getenv("DIARIZATION_SEG_GPU_PARTITION"); v && std::strcmp(v, "1") == 0) {
+            state->seg_state.experimental_gpu_partition = true;
+            state->seg_state.experimental_gpu_partition_mode = "linear";
+            fprintf(stderr, "[backend] segmentation experimental GPU partition mode=linear\n");
         }
         state->use_seg_ggml = true;
         has_seg_model = true;

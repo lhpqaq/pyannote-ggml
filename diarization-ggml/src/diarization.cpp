@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -332,8 +333,12 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     } else
 #endif
     {
-        const std::string seg_weight_backend =
+        std::string seg_weight_backend =
             (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
+        if (const char* wb = std::getenv("DIARIZATION_SEG_WEIGHT_BACKEND"); wb && wb[0]) {
+            seg_weight_backend = wb;
+            fprintf(stderr, "[backend] segmentation weight backend override=%s\n", seg_weight_backend.c_str());
+        }
 
         if (!segmentation::model_load(config.seg_model_path,
                                       seg_model,
@@ -352,7 +357,20 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             segmentation::model_free(seg_model);
             return false;
         }
-        segmentation::state_set_backend_stats(seg_state, true);
+        if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
+            std::string mode = m;
+            if (mode == "classifier" || mode == "linear" || mode == "linear-only" || mode == "all") {
+                seg_state.experimental_gpu_partition = true;
+                seg_state.experimental_gpu_partition_mode = mode;
+                fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());
+            }
+        } else if (const char* v = std::getenv("DIARIZATION_SEG_GPU_PARTITION"); v && std::strcmp(v, "1") == 0) {
+            seg_state.experimental_gpu_partition = true;
+            seg_state.experimental_gpu_partition_mode = "linear";
+            fprintf(stderr, "[backend] segmentation experimental GPU partition mode=linear\n");
+        }
+        const bool seg_stats_ok = (config.ggml_backend != "cuda");
+        segmentation::state_set_backend_stats(seg_state, seg_stats_ok);
     }
     
     t_stage_end = Clock::now();
@@ -406,7 +424,8 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             if (seg_model.ctx) segmentation::model_free(seg_model);
             return false;
         }
-        embedding::state_set_backend_stats(emb_state, true);
+        const bool enable_emb_backend_stats = (config.ggml_backend != "cuda");
+        embedding::state_set_backend_stats(emb_state, enable_emb_backend_stats);
     }
     
     t_stage_end = Clock::now();
