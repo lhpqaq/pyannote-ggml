@@ -16,6 +16,8 @@ struct StreamingConfig {
     std::string plda_path;
     std::string coreml_path;
     std::string seg_coreml_path;
+    std::string ggml_backend = "auto"; // auto | cpu | metal | cuda
+    int ggml_gpu_device = 0;
     bool zero_latency = false;
 };
 

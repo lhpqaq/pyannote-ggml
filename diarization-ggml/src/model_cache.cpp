@@ -39,7 +39,10 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
             delete cache;
             return nullptr;
         }
-        if (!segmentation::state_init(cache->seg_state, cache->seg_model, false)) {
+        if (!segmentation::state_init(cache->seg_state, cache->seg_model,
+                                      config.ggml_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "model_cache_load: failed to init segmentation GGML state\n");
             free_ggml_diarization_models(cache);
             delete cache;
@@ -57,7 +60,10 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
             delete cache;
             return nullptr;
         }
-        if (!embedding::state_init(cache->emb_state, cache->emb_model, false)) {
+        if (!embedding::state_init(cache->emb_state, cache->emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "model_cache_load: failed to init embedding GGML state\n");
             free_ggml_diarization_models(cache);
             delete cache;

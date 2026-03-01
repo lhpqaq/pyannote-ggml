@@ -158,6 +158,10 @@ bool extract_embeddings(
 {
     std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
 
+    int backend_nodes_total = 0;
+    int backend_nodes_gpu = 0;
+    int backend_nodes_cpu = 0;
+
     for (int c = 0; c < num_chunks; c++) {
         const int chunk_start = c * STEP_SAMPLES;
         int copy_len = num_samples - chunk_start;
@@ -231,11 +235,23 @@ bool extract_embeddings(
                 embedding::model_infer(*emb_model, *emb_state,
                                        masked_fbank.data(), num_fbank_frames,
                                        emb_out, EMBEDDING_DIM);
+                backend_nodes_total += emb_state->last_nodes_total;
+                backend_nodes_gpu += emb_state->last_nodes_gpu;
+                backend_nodes_cpu += emb_state->last_nodes_cpu;
             } else {
                 fprintf(stderr, "Error: no embedding backend available\n");
                 return false;
             }
         }
+    }
+
+    if (emb_model && emb_state && emb_state->backend_stats && backend_nodes_total > 0) {
+        fprintf(stderr,
+                "[backend] embedding nodes total=%d gpu=%d cpu=%d gpu_ratio=%.1f%%\n",
+                backend_nodes_total,
+                backend_nodes_gpu,
+                backend_nodes_cpu,
+                100.0 * (double) backend_nodes_gpu / (double) backend_nodes_total);
     }
 
     return true;
@@ -321,11 +337,15 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                     config.seg_model_path.c_str());
             return false;
         }
-        if (!segmentation::state_init(seg_state, seg_model, false)) {
+        if (!segmentation::state_init(seg_state, seg_model,
+                                      config.ggml_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "Error: failed to initialize segmentation state\n");
             segmentation::model_free(seg_model);
             return false;
         }
+        segmentation::state_set_backend_stats(seg_state, true);
     }
     
     t_stage_end = Clock::now();
@@ -363,13 +383,17 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             if (seg_model.ctx) segmentation::model_free(seg_model);
             return false;
         }
-        if (!embedding::state_init(emb_state, emb_model, false)) {
+        if (!embedding::state_init(emb_state, emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "Error: failed to initialize embedding state\n");
             embedding::model_free(emb_model);
             if (seg_state.sched) segmentation::state_free(seg_state);
             if (seg_model.ctx) segmentation::model_free(seg_model);
             return false;
         }
+        embedding::state_set_backend_stats(emb_state, true);
     }
     
     t_stage_end = Clock::now();
@@ -474,6 +498,15 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                         }
                     }
                 }
+            }
+
+            if (seg_state.backend_stats && c == num_chunks - 1 && seg_state.last_nodes_total > 0) {
+                fprintf(stderr,
+                        "\n[backend] segmentation nodes total=%d gpu=%d cpu=%d gpu_ratio=%.1f%%\n",
+                        seg_state.last_nodes_total,
+                        seg_state.last_nodes_gpu,
+                        seg_state.last_nodes_cpu,
+                        100.0 * (double) seg_state.last_nodes_gpu / (double) seg_state.last_nodes_total);
             }
 
             if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {

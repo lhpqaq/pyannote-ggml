@@ -15,6 +15,8 @@ struct OfflinePipelineConfig {
     std::string plda_path;
     std::string coreml_path;       // embedding CoreML
     std::string seg_coreml_path;   // segmentation CoreML
+    std::string ggml_backend = "auto"; // auto | cpu | metal | cuda
+    int ggml_gpu_device = 0;
 
     // Progress callback: phase (0=whisper, 1=diarization, 2=alignment), progress (0-100)
     // Optional — null check before calling.

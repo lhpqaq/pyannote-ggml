@@ -142,9 +142,17 @@ struct lstm_weight_cache {
  */
 struct segmentation_state {
     std::vector<ggml_backend_t> backends;
+    ggml_backend_t preferred_gpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> graph_meta;
     lstm_weight_cache lstm_cache;
+
+    // Optional backend hit statistics for last graph
+    bool backend_stats = false;
+    int last_nodes_total = 0;
+    int last_nodes_gpu = 0;
+    int last_nodes_cpu = 0;
+    bool printed_gpu_coverage = false;
 };
 
 // ============================================================================
@@ -206,6 +214,13 @@ bool model_verify(const segmentation_model& model);
  */
 bool state_init(segmentation_state& state, segmentation_model& model, bool verbose = true);
 
+// Explicit GGML backend selection: auto | cpu | metal | cuda
+bool state_init(segmentation_state& state,
+                segmentation_model& model,
+                const std::string& backend,
+                int gpu_device,
+                bool verbose);
+
 /**
  * @brief Free state resources
  * @param state State to free
@@ -263,6 +278,8 @@ bool model_infer(
     size_t n_samples,
     float* output,
     size_t output_size);
+
+void state_set_backend_stats(segmentation_state& state, bool enable);
 
 /**
  * @brief Forward pass through the complete segmentation model (graph building only)

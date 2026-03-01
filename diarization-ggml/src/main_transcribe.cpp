@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -317,6 +318,8 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --plda <path>           PLDA model path\n");
     fprintf(stderr, "  --seg-coreml <path>     Segmentation CoreML model path\n");
     fprintf(stderr, "  --emb-coreml <path>     Embedding CoreML model path\n");
+    fprintf(stderr, "  --backend <name>        GGML backend: auto|cpu|metal|cuda\n");
+    fprintf(stderr, "  --gpu-device <id>       GPU device index for CUDA backend\n");
     fprintf(stderr, "  --vad-model <path>      Optional Silero VAD model path\n");
     fprintf(stderr, "  --language <lang>       Whisper language code (default: en)\n");
     fprintf(stderr, "  -o, --output <path>     Output JSON file (default: stdout)\n");
@@ -348,6 +351,8 @@ int main(int argc, char** argv) {
     const char* vad_model = nullptr;
     const char* rttm_path = nullptr;
     const char* language = "en";
+    std::string ggml_backend = "auto";
+    int ggml_gpu_device = 0;
     bool realtime = false;
     bool stats = false;
     bool offline = false;
@@ -380,6 +385,10 @@ int main(int argc, char** argv) {
             vad_model = argv[++i];
         } else if (arg == "--language" && i + 1 < argc) {
             language = argv[++i];
+        } else if (arg == "--backend" && i + 1 < argc) {
+            ggml_backend = argv[++i];
+        } else if (arg == "--gpu-device" && i + 1 < argc) {
+            ggml_gpu_device = std::atoi(argv[++i]);
         } else if (arg == "--rttm" && i + 1 < argc) {
             rttm_path = argv[++i];
         } else if (arg == "--realtime") {
@@ -423,6 +432,8 @@ int main(int argc, char** argv) {
         offline_config.plda_path       = plda_model;
         if (seg_coreml) offline_config.seg_coreml_path = seg_coreml;
         if (emb_coreml) offline_config.coreml_path     = emb_coreml;
+        offline_config.ggml_backend = ggml_backend;
+        offline_config.ggml_gpu_device = ggml_gpu_device;
         offline_config.transcriber.whisper_model_path = whisper_model;
         offline_config.transcriber.n_threads          = 4;
         offline_config.transcriber.language           = language;
@@ -510,6 +521,8 @@ int main(int argc, char** argv) {
     if (emb_coreml) {
         config.diarization.coreml_path = emb_coreml;
     }
+    config.diarization.ggml_backend = ggml_backend;
+    config.diarization.ggml_gpu_device = ggml_gpu_device;
     config.transcriber.whisper_model_path = whisper_model;
     config.transcriber.n_threads = 4;
     config.transcriber.language = language;

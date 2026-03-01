@@ -285,7 +285,10 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
-        if (!segmentation::state_init(state->seg_state, state->seg_model, false)) {
+        if (!segmentation::state_init(state->seg_state, state->seg_model,
+                                      config.ggml_backend,
+                                      config.ggml_gpu_device,
+                                      false)) {
             fprintf(stderr, "Error: failed to initialize segmentation state\n");
             free_owned_models(state);
             delete state;
@@ -310,7 +313,10 @@ StreamingState* streaming_init(const StreamingConfig& config) {
             delete state;
             return nullptr;
         }
-        if (!embedding::state_init(state->emb_state, state->emb_model, false)) {
+        if (!embedding::state_init(state->emb_state, state->emb_model,
+                                   config.ggml_backend,
+                                   config.ggml_gpu_device,
+                                   false)) {
             fprintf(stderr, "Error: failed to initialize embedding state\n");
             free_owned_models(state);
             delete state;

@@ -170,6 +170,8 @@ OfflinePipelineResult offline_transcribe(
     diar_config.plda_path       = config.plda_path;
     diar_config.coreml_path     = config.coreml_path;
     diar_config.seg_coreml_path = config.seg_coreml_path;
+    diar_config.ggml_backend    = config.ggml_backend;
+    diar_config.ggml_gpu_device = config.ggml_gpu_device;
     // output_path left empty — no RTTM file output
 
     DiarizationResult diar_result;
@@ -379,6 +381,8 @@ OfflinePipelineResult offline_transcribe_with_cache(
     diar_config.plda_path       = config.plda_path;
     diar_config.coreml_path     = config.coreml_path;
     diar_config.seg_coreml_path = config.seg_coreml_path;
+    diar_config.ggml_backend    = config.ggml_backend;
+    diar_config.ggml_gpu_device = config.ggml_gpu_device;
     // output_path left empty — no RTTM file output
 
     DiarizationResult diar_result;

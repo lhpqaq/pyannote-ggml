@@ -12,6 +12,8 @@ struct DiarizationConfig {
     std::string seg_coreml_path;
     std::string output_path;
     std::string dump_stage;  // empty = none
+    std::string ggml_backend = "auto"; // auto | cpu | metal | cuda
+    int ggml_gpu_device = 0;
 };
 
 struct DiarizationResult {

@@ -21,6 +21,8 @@ struct ModelCacheConfig {
     std::string plda_path;
     std::string seg_coreml_path;
     std::string coreml_path;  // embedding CoreML
+    std::string ggml_backend = "auto"; // auto | cpu | metal | cuda
+    int ggml_gpu_device = 0;
 
     // Whisper
     TranscriberConfig transcriber;  // contains whisper_model_path + context params

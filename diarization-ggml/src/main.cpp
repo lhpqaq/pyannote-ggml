@@ -1,6 +1,7 @@
 #include "diarization.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 
 static void print_usage(const char* program) {
@@ -15,6 +16,8 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --plda <path>         Path to PLDA binary file\n");
     fprintf(stderr, "  --coreml <path>       Path to CoreML embedding model (.mlpackage)\n");
     fprintf(stderr, "  --seg-coreml <path>   Path to CoreML segmentation model (.mlpackage)\n");
+    fprintf(stderr, "  --backend <name>      GGML backend: auto|cpu|metal|cuda\n");
+    fprintf(stderr, "  --gpu-device <id>     GPU device index for CUDA backend\n");
     fprintf(stderr, "  -o, --output <path>   Output RTTM file (default: stdout)\n");
     fprintf(stderr, "  --dump-stage <name>   Dump intermediate stage to binary file\n");
     fprintf(stderr, "  --help                Print this help message\n");
@@ -50,6 +53,10 @@ int main(int argc, char** argv) {
             config.coreml_path = argv[++i];
         } else if (arg == "--seg-coreml" && i + 1 < argc) {
             config.seg_coreml_path = argv[++i];
+        } else if (arg == "--backend" && i + 1 < argc) {
+            config.ggml_backend = argv[++i];
+        } else if (arg == "--gpu-device" && i + 1 < argc) {
+            config.ggml_gpu_device = std::atoi(argv[++i]);
         } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
             config.output_path = argv[++i];
         } else if (arg == "--dump-stage" && i + 1 < argc) {

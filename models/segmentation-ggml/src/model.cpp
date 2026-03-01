@@ -7,6 +7,7 @@
 #include <sstream>
 #include <chrono>
 #include <ggml-alloc.h>
+#include <ggml.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
 
@@ -81,6 +82,54 @@ static bool verify_tensor_shape(struct ggml_tensor* tensor, const char* name,
     }
     
     return match;
+}
+
+static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml_cgraph* graph) {
+    (void) state;
+    (void) graph;
+    return 0;
+}
+
+static void report_gpu_offload_coverage_once(segmentation_state& state, struct ggml_cgraph* graph) {
+    if (!state.preferred_gpu || !graph || state.printed_gpu_coverage) {
+        return;
+    }
+
+    int preferred_total = 0;
+    int preferred_supported = 0;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if (!node) {
+            continue;
+        }
+
+        switch (node->op) {
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_CONV_2D:
+            case GGML_OP_LEAKY_RELU:
+            case GGML_OP_SOFT_MAX:
+            case GGML_OP_LOG:
+                preferred_total++;
+                if (ggml_backend_supports_op(state.preferred_gpu, node)) {
+                    preferred_supported++;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (preferred_total > 0) {
+        fprintf(stderr,
+                "[backend] segmentation gpu-op support %d/%d (%.1f%%)\n",
+                preferred_supported,
+                preferred_total,
+                100.0 * (double) preferred_supported / (double) preferred_total);
+    }
+
+    state.printed_gpu_coverage = true;
 }
 
 // ============================================================================
@@ -511,16 +560,80 @@ bool model_verify(const segmentation_model& model) {
 // ============================================================================
 
 bool state_init(segmentation_state& state, segmentation_model& model, bool verbose) {
+    return state_init(state, model, "auto", 0, verbose);
+}
+
+bool state_init(segmentation_state& state,
+                segmentation_model& model,
+                const std::string& backend,
+                int gpu_device,
+                bool verbose) {
     if (verbose) printf("\nInitializing inference state...\n");
-    
-    ggml_backend_t cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    if (!cpu_backend) {
+
+    state.backends.clear();
+
+    const bool want_cpu = backend == "cpu" || backend == "auto";
+    const bool want_metal = backend == "metal";
+    const bool want_cuda = backend == "cuda";
+
+    ggml_backend_t cpu_primary = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!cpu_primary) {
         fprintf(stderr, "ERROR: Failed to initialize CPU backend\n");
         return false;
     }
-    ggml_backend_cpu_set_n_threads(cpu_backend, 4);
-    state.backends.push_back(cpu_backend);
-    if (verbose) printf("  Using CPU backend: %s (4 threads)\n", ggml_backend_name(cpu_backend));
+    ggml_backend_cpu_set_n_threads(cpu_primary, 4);
+    state.backends.push_back(cpu_primary);
+    if (verbose) printf("  Using CPU backend: %s (4 threads)\n", ggml_backend_name(cpu_primary));
+
+    if (want_metal) {
+        ggml_backend_t metal_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, "Metal");
+        if (metal_backend) {
+            state.backends.push_back(metal_backend);
+            if (verbose) printf("  Using GPU backend: %s\n", ggml_backend_name(metal_backend));
+        } else if (backend == "metal") {
+            fprintf(stderr, "ERROR: Failed to initialize Metal backend\n");
+            return false;
+        }
+    }
+
+    if (want_cuda) {
+        char device_desc[32];
+        std::snprintf(device_desc, sizeof(device_desc), "CUDA%d", gpu_device);
+        ggml_backend_t cuda_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, device_desc);
+        if (cuda_backend) {
+            state.backends.push_back(cuda_backend);
+            if (verbose) printf("  Using GPU backend: %s\n", ggml_backend_name(cuda_backend));
+        } else if (backend == "cuda") {
+            fprintf(stderr, "ERROR: Failed to initialize CUDA backend for device %d\n", gpu_device);
+            return false;
+        }
+    }
+
+    if (state.backends.size() > 1 || want_cpu) {
+        ggml_backend_t cpu_fallback = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!cpu_fallback) {
+            fprintf(stderr, "ERROR: Failed to initialize CPU fallback backend\n");
+            return false;
+        }
+        ggml_backend_cpu_set_n_threads(cpu_fallback, 4);
+        state.backends.push_back(cpu_fallback);
+        if (verbose) printf("  Using CPU fallback backend: %s (4 threads)\n", ggml_backend_name(cpu_fallback));
+    }
+
+    ggml_backend_t gpu_backend = nullptr;
+    for (ggml_backend_t backend_i : state.backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend_i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_backend = backend_i;
+            break;
+        }
+    }
+
+    if (!gpu_backend && backend != "cpu" && backend != "auto") {
+        fprintf(stderr, "ERROR: Requested backend '%s' unavailable\n", backend.c_str());
+        return false;
+    }
+    state.preferred_gpu = gpu_backend;
     
     // Step 2: Allocate graph metadata buffer
     // LSTM unrolling creates many nodes, need large metadata buffer
@@ -551,6 +664,9 @@ bool state_init(segmentation_state& state, segmentation_model& model, bool verbo
         return false;
     }
     
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
     if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
         fprintf(stderr, "ERROR: Failed to pre-allocate compute buffers\n");
         return false;
@@ -740,6 +856,9 @@ bool model_infer(
     
     auto prof_graph_built = std::chrono::high_resolution_clock::now();
     
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
     if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
         fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
         return false;
@@ -769,6 +888,30 @@ bool model_infer(
     lstm_reset_profile();
     lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
     
+    if (state.backend_stats) {
+        ggml_backend_sched_split_graph(state.sched, graph);
+        int n_nodes = ggml_graph_n_nodes(graph);
+        int n_cpu = 0;
+        int n_gpu = 0;
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor* node = ggml_graph_node(graph, i);
+            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(state.sched, node);
+            if (!b) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(b);
+            enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                n_gpu++;
+            } else if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_cpu++;
+            }
+        }
+        state.last_nodes_total = n_nodes;
+        state.last_nodes_cpu = n_cpu;
+        state.last_nodes_gpu = n_gpu;
+    }
+
     if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ERROR: Graph computation failed\n");
         ggml_backend_sched_reset(state.sched);
@@ -807,6 +950,10 @@ bool model_infer(
     }
     
     return true;
+}
+
+void state_set_backend_stats(segmentation_state& state, bool enable) {
+    state.backend_stats = enable;
 }
 
 // ============================================================================

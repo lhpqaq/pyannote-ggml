@@ -113,8 +113,9 @@ struct embedding_model {
  * and graph metadata buffer.
  */
 struct embedding_state {
-    // Backends (CPU-only)
+    // Backends (CPU / Metal / CUDA)
     std::vector<ggml_backend_t> backends;
+    ggml_backend_t preferred_gpu = nullptr;
 
     // Backend scheduler for automatic multi-backend orchestration
     ggml_backend_sched_t sched = nullptr;
@@ -124,6 +125,17 @@ struct embedding_state {
 
     // Number of frames for current graph (varies with audio duration)
     int num_frames = 0;
+
+    // Reusable transpose buffer for fbank input
+    std::vector<float> fbank_transposed;
+    std::vector<float> ones_buffer;
+
+    // Optional backend hit statistics for last graph
+    bool backend_stats = false;
+    int last_nodes_total = 0;
+    int last_nodes_gpu = 0;
+    int last_nodes_cpu = 0;
+    bool printed_gpu_coverage = false;
 };
 
 // ============================================================================
@@ -164,6 +176,13 @@ void model_print_memory_usage(const embedding_model& model, const embedding_stat
  * @brief Initialize inference state with backends and scheduler
  */
 bool state_init(embedding_state& state, embedding_model& model, bool verbose = true);
+
+// Explicit GGML backend selection: auto | cpu | metal | cuda
+bool state_init(embedding_state& state,
+                embedding_model& model,
+                const std::string& backend,
+                int gpu_device,
+                bool verbose);
 
 /**
  * @brief Free state resources
@@ -222,6 +241,8 @@ bool model_infer(
     int num_frames,
     float* output,
     size_t output_size);
+
+void state_set_backend_stats(embedding_state& state, bool enable);
 
 } // namespace embedding
 
