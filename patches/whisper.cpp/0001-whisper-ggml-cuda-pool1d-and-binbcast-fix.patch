@@ -1,0 +1,289 @@
+From e56168c58fba3f85a62d0cafb7be23ecc816ddf9 Mon Sep 17 00:00:00 2001
+From: lhpqaq <liuhaopeng@apache.org>
+Date: Mon, 2 Mar 2026 22:44:28 +0800
+Subject: [PATCH 1/2] ggml-cuda: add pool1d op and fix binbcast indexing
+
+This patch is intended to be applied on top of whisper.cpp commit
+`9c807c8056f8b3da89ede02015cef942f77de01b`.
+
+- Adds CUDA support for GGML_OP_POOL_1D (needed by pyannote segmentation).
+- Fixes binbcast indexing types and access pattern.
+
+---
+ ggml/src/ggml-cuda/binbcast.cu  | 62 ++++++++++++++++++--------
+ ggml/src/ggml-cuda/ggml-cuda.cu |  5 ++
+ ggml/src/ggml-cuda/pool1d.cu    | 98 ++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/pool1d.cuh   |  5 ++
+ 4 files changed, 148 insertions(+), 22 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/pool1d.cu
+ create mode 100644 ggml/src/ggml-cuda/pool1d.cuh
+
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index 0e6d777b..e639ef82 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -1,5 +1,7 @@
+ #include "binbcast.cuh"
+ #include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <utility>
+ 
+ static __device__ __forceinline__ float op_repeat(const float a, const float b) {
+@@ -39,16 +41,16 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
+                                    const uint3            ne11,
+                                    const uint3            ne12,
+                                    const uint3            ne13,
+-                                   /*int s0, */ const int s1,
+-                                   const int              s2,
+-                                   const int              s3,
+-                                   /*int s00,*/ const int s01,
+-                                   const int              s02,
+-                                   const int              s03,
+-                                   /*int s10,*/ const int s11,
+-                                   const int              s12,
+-                                   const int              s13,
+-                                   src1_ptrs... src1s) {
++                                    /*int64_t s0, */ const int64_t s1,
++                                    const int64_t                s2,
++                                    const int64_t                s3,
++                                    /*int64_t s00,*/ const int64_t s01,
++                                    const int64_t                s02,
++                                    const int64_t                s03,
++                                    /*int64_t s10,*/ const int64_t s11,
++                                    const int64_t                s12,
++                                    const int64_t                s13,
++                                    src1_ptrs... src1s) {
+     const uint32_t i0s = blockDim.x * blockIdx.x + threadIdx.x;
+     const uint32_t i1  = (blockDim.y * blockIdx.y + threadIdx.y);
+     const uint32_t i2  = fastdiv((blockDim.z * blockIdx.z + threadIdx.z), ne3);
+@@ -62,11 +64,12 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
+     const uint32_t i12 = fastmodulo(i2, ne12);
+     const uint32_t i13 = fastmodulo(i3, ne13);
+ 
+-    const size_t i_src0 =  i3*s03 +  i2*s02 +  i1*s01;
+-    const size_t i_src1 = i13*s13 + i12*s12 + i11*s11;
+-    const size_t i_dst  =  i3*s3  +  i2*s2  +  i1*s1;
++    const int64_t i_src0 =  (int64_t) i3*s03 +  (int64_t) i2*s02 +  (int64_t) i1*s01;
++    const int64_t i_src1 = (int64_t)i13*s13 + (int64_t)i12*s12 + (int64_t)i11*s11;
++    const int64_t i_dst  =  (int64_t) i3*s3  +  (int64_t) i2*s2  +  (int64_t) i1*s1;
+ 
+     const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
++    const src1_t * src1_row = src1 ? (src1 + i_src1) : nullptr;
+     dst_t * dst_row = dst + i_dst;
+ 
+     for (int i0 = i0s; i0 < ne0; i0 += blockDim.x * gridDim.x) {
+@@ -76,7 +79,7 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
+         if constexpr (sizeof...(src1_ptrs) > 0) {
+             result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
+         } else {
+-            result = bin_op(result, (float)src1[i_src1 + i10]);
++            result = bin_op(result, (float)src1_row[i10]);
+         }
+ 
+         dst_row[i0] = (dst_t) result;
+@@ -97,20 +100,20 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
+                                            const uint32_t         ne3,
+                                            const uint3            prod_012,
+                                            const uint3            prod_01,
+-                                           const uint3            ne10,
+-                                           const uint3            ne11,
+-                                           const uint3            ne12,
+-                                           const uint3            ne13,
+-                                           /*int s0, */ const int s1,
+-                                           const int              s2,
+-                                           const int              s3,
+-                                           /*int s00,*/ const int s01,
+-                                           const int              s02,
+-                                           const int              s03,
+-                                           /*int s10,*/ const int s11,
+-                                           const int              s12,
+-                                           const int              s13,
+-                                           src1_ptrs... src1s) {
++                                            const uint3            ne10,
++                                            const uint3            ne11,
++                                            const uint3            ne12,
++                                            const uint3            ne13,
++                                            /*int64_t s0, */ const int64_t s1,
++                                            const int64_t                s2,
++                                            const int64_t                s3,
++                                            /*int64_t s00,*/ const int64_t s01,
++                                            const int64_t                s02,
++                                            const int64_t                s03,
++                                            /*int64_t s10,*/ const int64_t s11,
++                                            const int64_t                s12,
++                                            const int64_t                s13,
++                                            src1_ptrs... src1s) {
+     const int i = blockDim.x*blockIdx.x + threadIdx.x;
+ 
+     const uint32_t i3 = fastdiv(i, prod_012);
+@@ -126,11 +129,12 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
+     const int i12 = fastmodulo(i2, ne12);
+     const int i13 = fastmodulo(i3, ne13);
+ 
+-    const size_t i_src0 =  i3*s03 +  i2*s02 +  i1*s01;
+-    const size_t i_src1 = i13*s13 + i12*s12 + i11*s11;
+-    const size_t i_dst  =  i3*s3  +  i2*s2  +  i1*s1;
++    const int64_t i_src0 =  (int64_t) i3*s03 +  (int64_t) i2*s02 +  (int64_t) i1*s01;
++    const int64_t i_src1 = (int64_t)i13*s13 + (int64_t)i12*s12 + (int64_t)i11*s11;
++    const int64_t i_dst  =  (int64_t) i3*s3  +  (int64_t) i2*s2  +  (int64_t) i1*s1;
+ 
+     const src0_t * src0_row = src0 ? (src0 + i_src0) : nullptr;
++    const src1_t * src1_row = src1 ? (src1 + i_src1) : nullptr;
+     dst_t * dst_row = dst + i_dst;
+ 
+     const int i10 = fastmodulo(i0, ne10);
+@@ -139,7 +143,7 @@ static __global__ void k_bin_bcast_unravel(const src0_t *         src0,
+     if constexpr (sizeof...(src1_ptrs) > 0) {
+         result = (..., (result = bin_op(result, (float)src1s[i_src1 + i10])));
+     } else {
+-        result = bin_op(result, (float)src1[i_src1 + i10]);
++        result = bin_op(result, (float)src1_row[i10]);
+     }
+ 
+     dst_row[i0] = (dst_t) result;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9e77c231..1cc150ed 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -34,6 +34,7 @@
+ #include "ggml-cuda/opt-step-sgd.cuh"
+ #include "ggml-cuda/out-prod.cuh"
+ #include "ggml-cuda/pad.cuh"
++#include "ggml-cuda/pool1d.cuh"
+ #include "ggml-cuda/pool2d.cuh"
+ #include "ggml-cuda/quantize.cuh"
+ #include "ggml-cuda/rope.cuh"
+@@ -2688,6 +2689,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             ggml_cuda_op_conv_transpose_1d(ctx,dst);
+             break;
++        case GGML_OP_POOL_1D:
++            ggml_cuda_op_pool1d(ctx, dst);
++            break;
+         case GGML_OP_POOL_2D:
+             ggml_cuda_op_pool2d(ctx, dst);
+             break;
+@@ -4819,6 +4823,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_CONV_2D:
+         case GGML_OP_CONV_2D_DW:
+         case GGML_OP_CONV_TRANSPOSE_2D:
++        case GGML_OP_POOL_1D:
+         case GGML_OP_POOL_2D:
+         case GGML_OP_ACC:
+             return true;
+diff --git a/ggml/src/ggml-cuda/pool1d.cu b/ggml/src/ggml-cuda/pool1d.cu
+new file mode 100644
+index 00000000..1ae32ea8
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pool1d.cu
+@@ -0,0 +1,98 @@
++#include "pool1d.cuh"
++
++template <typename Ti, typename To>
++static __global__ void pool1d_nchw_kernel(
++        const int iw, const int ow,
++        const int kw, const int sw,
++        const int pw, const int parallel_elements,
++        const Ti * src, To * dst, const enum ggml_op_pool op) {
++    const int idx = threadIdx.x + blockIdx.x * blockDim.x;
++    if (idx >= parallel_elements) {
++        return;
++    }
++
++    const int nc = idx / ow;
++    const int cur_ow = idx % ow;
++
++    const Ti * i_ptr = src + nc * iw;
++    To * o_ptr = dst + nc * ow;
++
++    const int start_w = cur_ow * sw - pw;
++    const int bw = max(0, start_w);
++    const int ew = min(iw, start_w + kw);
++
++    To res = 0;
++    switch (op) {
++        case GGML_OP_POOL_AVG: res = 0; break;
++        case GGML_OP_POOL_MAX: res = -FLT_MAX; break;
++        default: assert(false);
++    }
++
++    const To scale = 1.0f / kw;
++
++    for (int j = bw; j < ew; ++j) {
++#if __CUDA_ARCH__ >= 350
++        const Ti cur = __ldg(i_ptr + j);
++#else
++        const Ti cur = i_ptr[j];
++#endif
++        switch (op) {
++            case GGML_OP_POOL_AVG: res += cur * scale; break;
++            case GGML_OP_POOL_MAX: res = max(res, (To) cur); break;
++            default: assert(false);
++        }
++    }
++
++    o_ptr[cur_ow] = res;
++}
++
++static void pool1d_nchw_kernel_f32_f32_cuda(
++        const int iw, const int ow,
++        const int kw, const int sw,
++        const int pw, const int parallel_elements,
++        const float * src, float * dst, const enum ggml_op_pool op,
++        cudaStream_t stream) {
++
++    const int num_blocks = (parallel_elements + CUDA_POOL1D_BLOCK_SIZE - 1) / CUDA_POOL1D_BLOCK_SIZE;
++    dim3 block_nums(num_blocks);
++
++    pool1d_nchw_kernel<<<block_nums, CUDA_POOL1D_BLOCK_SIZE, 0, stream>>>(
++        iw, ow,
++        kw, sw,
++        pw, parallel_elements,
++        src, dst, op);
++}
++
++void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src0 = dst->src[0];
++    const float * src0_d = (const float *) src0->data;
++    float * dst_d = (float *) dst->data;
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(src0->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++
++    const int32_t * opts = (const int32_t *) dst->op_params;
++    const enum ggml_op_pool op = static_cast<enum ggml_op_pool>(opts[0]);
++    const int k0 = opts[1];
++    const int s0 = opts[2];
++    const int p0 = opts[3];
++
++    const int64_t IW = src0->ne[0];
++    const int64_t N = src0->ne[1] * src0->ne[2] * src0->ne[3];
++    const int64_t OW = dst->ne[0];
++
++    const int parallel_elements = (int) (N * OW);
++
++    pool1d_nchw_kernel_f32_f32_cuda(
++        (int) IW,
++        (int) OW,
++        k0,
++        s0,
++        p0,
++        parallel_elements,
++        src0_d,
++        dst_d,
++        op,
++        stream);
++}
+diff --git a/ggml/src/ggml-cuda/pool1d.cuh b/ggml/src/ggml-cuda/pool1d.cuh
+new file mode 100644
+index 00000000..c79461dd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/pool1d.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++#define CUDA_POOL1D_BLOCK_SIZE 256
++
++void ggml_cuda_op_pool1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

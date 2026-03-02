@@ -18,7 +18,10 @@ This file freezes the current working state before cleanup.
 
 - Because this repo uses `whisper.cpp` as a submodule and downstream users may not have
   submodule push permissions, the corresponding upstream patch is saved here:
-  - `patches/whisper.cpp/0001-cuda-add-pyannote-seg-LSTM-custom-op-fast-path.patch`
+  - Base whisper.cpp commit: `9c807c8056f8b3da89ede02015cef942f77de01b`
+  - Apply in order:
+    - `patches/whisper.cpp/0001-whisper-ggml-cuda-pool1d-and-binbcast-fix.patch`
+    - `patches/whisper.cpp/0002-whisper-ggml-cuda-pyannote-seg-custom-op.patch`
 
 ## Repro Commands (example)
 
