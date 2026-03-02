@@ -64,48 +64,8 @@ static void report_gpu_offload_coverage_once(embedding_state& state, struct ggml
 }
 
 static void maybe_dump_backend_assignment_ratio(embedding_state& state, struct ggml_cgraph* graph) {
-    const char* env = std::getenv("DIARIZATION_DEBUG_BACKEND_ASSIGN_RATIO");
-    if (!env || std::strcmp(env, "1") != 0 || !state.sched || !graph) {
-        return;
-    }
-
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    int n_gpu = 0;
-    int n_cpu = 0;
-    int n_other = 0;
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node) {
-            continue;
-        }
-        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(state.sched, node);
-        if (!b) {
-            continue;
-        }
-        ggml_backend_dev_t dev = ggml_backend_get_device(b);
-        if (!dev) {
-            n_other++;
-            continue;
-        }
-        enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            n_gpu++;
-        } else if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            n_cpu++;
-        } else {
-            n_other++;
-        }
-    }
-
-    if (n_nodes > 0) {
-        fprintf(stderr,
-                "[backend-assign] embedding nodes total=%d gpu=%d cpu=%d other=%d gpu_ratio=%.1f%%\n",
-                n_nodes,
-                n_gpu,
-                n_cpu,
-                n_other,
-                100.0 * (double) n_gpu / (double) n_nodes);
-    }
+    (void) state;
+    (void) graph;
 }
 
 static struct ggml_tensor* get_tensor(struct ggml_context* ctx, const char* name, bool required = true) {

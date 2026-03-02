@@ -92,52 +92,6 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
     if (!state.sched || !state.preferred_gpu || !graph) {
         return 0;
     }
-
-    ggml_backend_t cpu_backend = nullptr;
-    for (ggml_backend_t backend : state.backends) {
-        if (!backend) {
-            continue;
-        }
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            cpu_backend = backend;
-            break;
-        }
-    }
-
-    const char* force_stage_env = std::getenv("DIARIZATION_SEG_FORCE_CLASSIFIER_STAGE_CPU");
-    const bool force_classifier_stage_cpu =
-        force_stage_env && std::strcmp(force_stage_env, "1") == 0;
-
-    const char* dbg_assign = std::getenv("DIARIZATION_SEG_DEBUG_ASSIGN");
-    const bool dbg_assign_enabled = dbg_assign && std::strcmp(dbg_assign, "1") == 0;
-    const char* force_all_gpu_env = std::getenv("DIARIZATION_SEG_FORCE_ALL_GPU");
-    const bool force_all_gpu = force_all_gpu_env && std::strcmp(force_all_gpu_env, "1") == 0;
-    const char* full_gpu_env = std::getenv("DIARIZATION_SEG_FULL_GPU");
-    const bool full_gpu = full_gpu_env && std::strcmp(full_gpu_env, "1") == 0;
-    const char* force_cpu_im2col_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_IM2COL");
-    const bool force_cpu_im2col = force_cpu_im2col_env && std::strcmp(force_cpu_im2col_env, "1") == 0;
-    const char* force_cpu_mul_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_MUL");
-    const bool force_cpu_mul = force_cpu_mul_env && std::strcmp(force_cpu_mul_env, "1") == 0;
-    const char* force_cpu_set_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_SET");
-    const bool force_cpu_set = force_cpu_set_env && std::strcmp(force_cpu_set_env, "1") == 0;
-    const char* force_cpu_add_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_ADD");
-    const bool force_cpu_add = force_cpu_add_env && std::strcmp(force_cpu_add_env, "1") == 0;
-    const char* force_cpu_unary_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_UNARY");
-    const bool force_cpu_unary = force_cpu_unary_env && std::strcmp(force_cpu_unary_env, "1") == 0;
-    const char* force_cpu_view_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_VIEW");
-    const bool force_cpu_view = force_cpu_view_env && std::strcmp(force_cpu_view_env, "1") == 0;
-    const char* force_cpu_reshape_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_RESHAPE");
-    const bool force_cpu_reshape = force_cpu_reshape_env && std::strcmp(force_cpu_reshape_env, "1") == 0;
-    const char* force_cpu_sub_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_SUB");
-    const bool force_cpu_sub = force_cpu_sub_env && std::strcmp(force_cpu_sub_env, "1") == 0;
-
-    int gpu_only_first_mul = -1;
-    if (const char* env = std::getenv("DIARIZATION_SEG_GPU_ONLY_FIRST_MUL")) {
-        gpu_only_first_mul = std::atoi(env);
-    }
-    int mul_seen = 0;
-
     int assigned = 0;
     const int n_nodes = ggml_graph_n_nodes(graph);
     for (int i = 0; i < n_nodes; ++i) {
@@ -146,223 +100,10 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
             continue;
         }
 
-        if (force_cpu_im2col && cpu_backend && node->op == GGML_OP_IM2COL) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- im2col\n");
-            }
-            continue;
+        if (ggml_backend_supports_op(state.preferred_gpu, node)) {
+            ggml_backend_sched_set_tensor_backend(state.sched, node, state.preferred_gpu);
+            assigned++;
         }
-
-        if (force_cpu_mul && cpu_backend && node->op == GGML_OP_MUL) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- mul\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_set && cpu_backend && node->op == GGML_OP_SET) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- set\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_add && cpu_backend && node->op == GGML_OP_ADD) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- add\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_unary && cpu_backend && node->op == GGML_OP_UNARY) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- unary\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_view && cpu_backend && node->op == GGML_OP_VIEW) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- view\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_reshape && cpu_backend && node->op == GGML_OP_RESHAPE) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- reshape\n");
-            }
-            continue;
-        }
-
-        if (force_cpu_sub && cpu_backend && node->op == GGML_OP_SUB) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- sub\n");
-            }
-            continue;
-        }
-
-        if (force_classifier_stage_cpu && cpu_backend && node->name && std::strcmp(node->name, "classifier_stage_cpu") == 0) {
-            ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-            if (dbg_assign_enabled) {
-                fprintf(stderr, "[seg-assign] cpu <- classifier_stage_cpu\n");
-            }
-            continue;
-        }
-
-        if (!state.experimental_gpu_partition && !force_all_gpu && !full_gpu) {
-            continue;
-        }
-
-        if (!force_all_gpu && !full_gpu) {
-            // Experimental CoreML-like split idea: keep sensitive/custom parts on CPU,
-            // offload only selected matmul blocks.
-            if (node->op != GGML_OP_MUL_MAT) {
-                continue;
-            }
-        }
-
-        // Any matmul directly consuming 160000-sample waveform path is part of SincNet front-end.
-        // Keep it on CPU for stability in CUDA backend.
-        bool touches_waveform = false;
-        for (int si = 0; si < GGML_MAX_SRC; ++si) {
-            if (node->src[si] && node->src[si]->ne[0] == 160000) {
-                touches_waveform = true;
-                break;
-            }
-        }
-        if (touches_waveform && !force_all_gpu && !full_gpu) {
-            continue;
-        }
-
-        const bool mode_all = state.experimental_gpu_partition_mode == "all";
-        const bool mode_linear = state.experimental_gpu_partition_mode == "linear";
-        const bool mode_classifier = state.experimental_gpu_partition_mode == "classifier";
-        const char* node_name = node->name;
-        const bool is_classifier_mm = node_name && std::strcmp(node_name, "classifier_mm") == 0;
-        const bool is_linear_mm = node_name &&
-                                  (std::strcmp(node_name, "linear1_mm") == 0 ||
-                                   std::strcmp(node_name, "linear2_mm") == 0);
-
-        if (!force_all_gpu && !full_gpu && mode_classifier) {
-            if (!is_classifier_mm) {
-                continue;
-            }
-
-            // Extra safety in classifier-only mode: gate on expected classifier matmul layout
-            // to avoid accidentally offloading similarly-shaped matmuls.
-            if (is_classifier_mm && (!node->src[0] || !node->src[1])) {
-                if (dbg_assign_enabled) {
-                    fprintf(stderr, "[seg-assign] skip classifier_mm: missing src tensors\n");
-                }
-                continue;
-            }
-
-            // Expected classifier tensors:
-            // src0 = classifier.weight [128, 7], src1 = x_2d [128, T], out = [7, T]
-            const bool classifier_shape_ok = !is_classifier_mm || (
-                node->src[0]->ne[0] == 128 &&
-                node->src[0]->ne[1] == 7 &&
-                node->src[1]->ne[0] == 128 &&
-                node->ne[0] == 7);
-            if (!classifier_shape_ok) {
-                if (dbg_assign_enabled) {
-                    fprintf(stderr,
-                            "[seg-assign] skip classifier_mm: unexpected shape out=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
-                            (long long) node->ne[0],
-                            (long long) node->ne[1],
-                            (long long) node->ne[2],
-                            (long long) node->ne[3],
-                            (long long) node->src[0]->ne[0],
-                            (long long) node->src[0]->ne[1],
-                            (long long) node->src[0]->ne[2],
-                            (long long) node->src[0]->ne[3],
-                            (long long) node->src[1]->ne[0],
-                            (long long) node->src[1]->ne[1],
-                            (long long) node->src[1]->ne[2],
-                            (long long) node->src[1]->ne[3]);
-                }
-                continue;
-            }
-
-        } else if (!force_all_gpu && !full_gpu && mode_linear) {
-            if (!is_classifier_mm && !is_linear_mm) {
-                continue;
-            }
-        } else if (!force_all_gpu && !full_gpu && !mode_all) {
-            continue;
-        }
-
-        if (!ggml_backend_supports_op(state.preferred_gpu, node)) {
-            if (dbg_assign_enabled) {
-                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
-                fprintf(stderr, "[seg-assign] skip %s: gpu backend does not support op\n", node_name_dbg);
-            }
-            continue;
-        }
-
-        if (gpu_only_first_mul >= 0 && cpu_backend && node->op == GGML_OP_MUL) {
-            if (mul_seen >= gpu_only_first_mul) {
-                ggml_backend_sched_set_tensor_backend(state.sched, node, cpu_backend);
-                if (dbg_assign_enabled) {
-                    fprintf(stderr, "[seg-assign] cpu <- mul (limit %d, idx %d)\n", gpu_only_first_mul, mul_seen);
-                }
-                mul_seen++;
-                continue;
-            }
-            mul_seen++;
-        }
-
-        // Strict safety for custom-op boundary in partition mode: only offload matmul when both inputs
-        // are plain contiguous tensors to avoid layout-dependent mismatch.
-        if (!force_all_gpu && !full_gpu && (!node->src[0] || !node->src[1])) {
-            if (dbg_assign_enabled) {
-                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
-                fprintf(stderr, "[seg-assign] skip %s: missing src0/src1\n", node_name_dbg);
-            }
-            continue;
-        }
-        if (!force_all_gpu && !full_gpu && (!ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node->src[1]))) {
-            if (dbg_assign_enabled) {
-                const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
-                fprintf(stderr,
-                        "[seg-assign] skip %s: non-contiguous src (src0=%d src1=%d)\n",
-                        node_name_dbg,
-                        ggml_is_contiguous(node->src[0]) ? 1 : 0,
-                        ggml_is_contiguous(node->src[1]) ? 1 : 0);
-            }
-            continue;
-        }
-
-        ggml_backend_sched_set_tensor_backend(state.sched, node, state.preferred_gpu);
-        if (dbg_assign_enabled) {
-            const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
-            fprintf(stderr,
-                    "[seg-assign] gpu <- %s op=%d ne=[%lld,%lld,%lld,%lld] src0=[%lld,%lld,%lld,%lld] src1=[%lld,%lld,%lld,%lld]\n",
-                    node_name_dbg,
-                    (int) node->op,
-                    (long long) node->ne[0],
-                    (long long) node->ne[1],
-                    (long long) node->ne[2],
-                    (long long) node->ne[3],
-                    node->src[0] ? (long long) node->src[0]->ne[0] : -1LL,
-                    node->src[0] ? (long long) node->src[0]->ne[1] : -1LL,
-                    node->src[0] ? (long long) node->src[0]->ne[2] : -1LL,
-                    node->src[0] ? (long long) node->src[0]->ne[3] : -1LL,
-                    node->src[1] ? (long long) node->src[1]->ne[0] : -1LL,
-                    node->src[1] ? (long long) node->src[1]->ne[1] : -1LL,
-                    node->src[1] ? (long long) node->src[1]->ne[2] : -1LL,
-                    node->src[1] ? (long long) node->src[1]->ne[3] : -1LL);
-        }
-        assigned++;
     }
 
     return assigned;
@@ -394,238 +135,6 @@ static void dump_tensor_binary(struct ggml_cgraph* graph, const char* tensor_nam
         return;
     }
     out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)nbytes);
-}
-
-static void dump_tensor_binary_from_tensor(struct ggml_tensor* tensor,
-                                           const char* tag,
-                                           const char* path_prefix,
-                                           int infer_index) {
-    if (!tensor || !tag || !path_prefix) {
-        return;
-    }
-
-    const size_t nbytes = ggml_nbytes(tensor);
-    if (nbytes == 0) {
-        return;
-    }
-
-    std::vector<uint8_t> bytes(nbytes);
-    ggml_backend_tensor_get(tensor, bytes.data(), 0, nbytes);
-
-    char dump_path[1024];
-    std::snprintf(dump_path, sizeof(dump_path), "%s/seg_%s_%04d.bin", path_prefix, tag, infer_index);
-
-    std::ofstream out(dump_path, std::ios::binary);
-    if (!out.good()) {
-        return;
-    }
-    out.write(reinterpret_cast<const char*>(bytes.data()), (std::streamsize)nbytes);
-}
-
-static void maybe_dump_tensor_meta(struct ggml_tensor* tensor, const char* tag) {
-    const char* dbg = std::getenv("DIARIZATION_SEG_DEBUG_TENSOR_META");
-    if (!dbg || std::strcmp(dbg, "1") != 0 || !tensor || !tag) {
-        return;
-    }
-
-    fprintf(stderr,
-            "[seg-meta] %s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contiguous=%d\n",
-            tag,
-            ggml_type_name(tensor->type),
-            (long long) tensor->ne[0],
-            (long long) tensor->ne[1],
-            (long long) tensor->ne[2],
-            (long long) tensor->ne[3],
-            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
-            ggml_is_contiguous(tensor) ? 1 : 0);
-}
-
-static const char* backend_dev_type_label(ggml_backend_t backend) {
-    if (!backend) {
-        return "none";
-    }
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (!dev) {
-        return "unknown";
-    }
-    switch (ggml_backend_dev_type(dev)) {
-        case GGML_BACKEND_DEVICE_TYPE_CPU:
-            return "cpu";
-        case GGML_BACKEND_DEVICE_TYPE_GPU:
-            return "gpu";
-        case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-            return "accel";
-        default:
-            return "other";
-    }
-}
-
-static void maybe_dump_classifier_backend_map(segmentation_state& state, struct ggml_cgraph* graph) {
-    const char* dbg = std::getenv("DIARIZATION_SEG_DEBUG_BACKEND_MAP");
-    if (!dbg || std::strcmp(dbg, "1") != 0 || !state.sched || !graph) {
-        return;
-    }
-
-    std::vector<struct ggml_tensor*> targets;
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node || !node->name) {
-            continue;
-        }
-        if (std::strcmp(node->name, "linear1_mm") == 0 ||
-            std::strcmp(node->name, "linear2_mm") == 0 ||
-            std::strcmp(node->name, "classifier_mm") == 0 ||
-            std::strcmp(node->name, "classifier_out") == 0) {
-            targets.push_back(node);
-        }
-    }
-
-    if (targets.empty()) {
-        fprintf(stderr, "[seg-backend-map] no target nodes found\n");
-        return;
-    }
-
-    fprintf(stderr, "[seg-backend-map] infer=%d nodes=%d\n", state.infer_call_index, n_nodes);
-
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node) {
-            continue;
-        }
-
-        bool in_neighborhood = false;
-        for (struct ggml_tensor* t : targets) {
-            if (node == t) {
-                in_neighborhood = true;
-                break;
-            }
-            for (int si = 0; si < GGML_MAX_SRC; ++si) {
-                if (node->src[si] == t || t->src[si] == node) {
-                    in_neighborhood = true;
-                    break;
-                }
-            }
-            if (in_neighborhood) {
-                break;
-            }
-        }
-
-        if (!in_neighborhood) {
-            continue;
-        }
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(state.sched, node);
-        const char* node_name = (node->name && node->name[0]) ? node->name : "(unnamed)";
-        fprintf(stderr,
-                "[seg-backend-map] i=%d name=%s op=%d backend=%s bptr=%p tptr=%p data=%p ne=[%lld,%lld,%lld,%lld]\n",
-                i,
-                node_name,
-                (int) node->op,
-                backend_dev_type_label(backend),
-                (void*) backend,
-                (void*) node,
-                node->data,
-                (long long) node->ne[0],
-                (long long) node->ne[1],
-                (long long) node->ne[2],
-                (long long) node->ne[3]);
-    }
-}
-
-static void maybe_dump_backend_assignment_ratio(segmentation_state& state, struct ggml_cgraph* graph) {
-    const char* env = std::getenv("DIARIZATION_DEBUG_BACKEND_ASSIGN_RATIO");
-    if (!env || std::strcmp(env, "1") != 0 || !state.sched || !graph) {
-        return;
-    }
-
-    int n_nodes = ggml_graph_n_nodes(graph);
-    int n_gpu = 0;
-    int n_cpu = 0;
-    int n_other = 0;
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node) {
-            continue;
-        }
-        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(state.sched, node);
-        if (!b) {
-            continue;
-        }
-        ggml_backend_dev_t dev = ggml_backend_get_device(b);
-        if (!dev) {
-            n_other++;
-            continue;
-        }
-        enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            n_gpu++;
-        } else if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            n_cpu++;
-        } else {
-            n_other++;
-        }
-    }
-
-    if (n_nodes > 0) {
-        fprintf(stderr,
-                "[backend-assign] segmentation nodes total=%d gpu=%d cpu=%d other=%d gpu_ratio=%.1f%%\n",
-                n_nodes,
-                n_gpu,
-                n_cpu,
-                n_other,
-                100.0 * (double) n_gpu / (double) n_nodes);
-    }
-}
-
-static void dump_selected_graph_nodes(struct ggml_cgraph* graph, const char* path_prefix, int infer_index) {
-    if (!graph || !path_prefix) {
-        return;
-    }
-
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node || node->op != GGML_OP_MUL_MAT) {
-            continue;
-        }
-
-        // dump only small head matmuls to avoid huge files
-        const int64_t out_ch = node->ne[1];
-        if (out_ch != 7 && out_ch != 128) {
-            continue;
-        }
-
-        char safe_name[80];
-        const char* node_name = (node->name && node->name[0]) ? node->name : "unnamed_mm";
-        std::snprintf(safe_name, sizeof(safe_name), "mm_%02d_%s", i, node_name);
-        dump_tensor_binary_from_tensor(node, safe_name, path_prefix, infer_index);
-    }
-}
-
-static void dump_classifier_mm_inputs(struct ggml_cgraph* graph, const char* path_prefix, int infer_index) {
-    if (!graph || !path_prefix) {
-        return;
-    }
-
-    const int n_nodes = ggml_graph_n_nodes(graph);
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node || node->op != GGML_OP_MUL_MAT) {
-            continue;
-        }
-        if (!node->name || std::strcmp(node->name, "classifier_mm") != 0) {
-            continue;
-        }
-
-        if (node->src[0]) {
-            dump_tensor_binary_from_tensor(node->src[0], "classifier_mm_src0", path_prefix, infer_index);
-        }
-        if (node->src[1]) {
-            dump_tensor_binary_from_tensor(node->src[1], "classifier_mm_src1", path_prefix, infer_index);
-        }
-        return;
-    }
 }
 
 static void report_gpu_offload_coverage_once(segmentation_state& state, struct ggml_cgraph* graph) {
@@ -668,55 +177,6 @@ static void report_gpu_offload_coverage_once(segmentation_state& state, struct g
     }
 
     state.printed_gpu_coverage = true;
-}
-
-static void maybe_report_op_gap_inventory(segmentation_state& state, struct ggml_cgraph* graph) {
-    const char* env = std::getenv("DIARIZATION_SEG_OP_GAP");
-    if (!env || std::strcmp(env, "1") != 0 || !graph || !state.preferred_gpu) {
-        return;
-    }
-
-    // Report once per state to keep logs readable.
-    if (state.infer_call_index > 0) {
-        return;
-    }
-
-    struct op_stat {
-        int total = 0;
-        int gpu_supported = 0;
-    };
-
-    std::map<std::string, op_stat> by_op;
-    const int n_nodes = ggml_graph_n_nodes(graph);
-
-    for (int i = 0; i < n_nodes; ++i) {
-        struct ggml_tensor* node = ggml_graph_node(graph, i);
-        if (!node) {
-            continue;
-        }
-
-        const char* op_name = ggml_op_name(node->op);
-        auto& st = by_op[op_name ? op_name : "(unknown)"];
-        st.total++;
-        if (ggml_backend_supports_op(state.preferred_gpu, node)) {
-            st.gpu_supported++;
-        }
-    }
-
-    fprintf(stderr, "[seg-op-gap] total_nodes=%d unique_ops=%zu\n", n_nodes, by_op.size());
-    for (const auto& kv : by_op) {
-        const char* op_name = kv.first.c_str();
-        const int total = kv.second.total;
-        const int gpu_supported = kv.second.gpu_supported;
-        const int missing = total - gpu_supported;
-        fprintf(stderr,
-                "[seg-op-gap] op=%-18s total=%4d gpu_supported=%4d missing=%4d support=%.1f%%\n",
-                op_name,
-                total,
-                gpu_supported,
-                missing,
-                total > 0 ? 100.0 * (double) gpu_supported / (double) total : 0.0);
-    }
 }
 
 // ============================================================================
@@ -1269,11 +729,7 @@ bool state_init(segmentation_state& state,
     state.preferred_gpu = gpu_backend;
     
     // Step 2: Allocate graph metadata buffer
-    // LSTM unrolling creates many nodes, need large metadata buffer
     size_t meta_size = ggml_tensor_overhead() * MAX_GRAPH_NODES + ggml_graph_overhead_custom(MAX_GRAPH_NODES, false);
-    // Non-custom LSTM unrolling can get very close to the calculated overhead. Keep a small
-    // safety margin to avoid rare "not enough space in the context's memory pool" aborts.
-    meta_size += 64 * 1024 * 1024;
     state.graph_meta.resize(meta_size);
     if (verbose) printf("  Graph metadata buffer: %.2f MB\n", meta_size / 1024.0 / 1024.0);
     
@@ -1302,7 +758,7 @@ bool state_init(segmentation_state& state,
     
     prefer_gpu_for_supported_nodes(state, graph);
     report_gpu_offload_coverage_once(state, graph);
-    maybe_report_op_gap_inventory(state, graph);
+    // (debug) op inventory removed in cleanup branch
 
     if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
         fprintf(stderr, "ERROR: Failed to pre-allocate compute buffers\n");
@@ -1311,7 +767,7 @@ bool state_init(segmentation_state& state,
     
     ggml_backend_sched_reset(state.sched);
     
-    if (verbose) printf("  Pre-converting LSTM weights (F16→F32 cache)...\n");
+    if (verbose) printf("  Pre-converting LSTM weights (F16->F32 cache)...\n");
     lstm_init_weight_cache(state.lstm_cache, model);
     
     if (verbose) printf("  State initialized successfully\n");
@@ -1376,31 +832,14 @@ static struct ggml_tensor* classifier_forward(
     int64_t input_dim = x->ne[1];
     int64_t num_classes = weight->ne[1];
 
-    maybe_dump_tensor_meta(x, "classifier_in_x");
-    maybe_dump_tensor_meta(weight, "classifier_weight");
-    maybe_dump_tensor_meta(bias, "classifier_bias");
-    
     struct ggml_tensor* x_t = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_t = ggml_cont(ctx, x_t);
-    maybe_dump_tensor_meta(x_t, "classifier_x_t");
 
     struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
     x_2d = ggml_cont(ctx, x_2d);
-    maybe_dump_tensor_meta(x_2d, "classifier_x_2d");
-
-    const char* force_stage = std::getenv("DIARIZATION_SEG_FORCE_CLASSIFIER_STAGE_CPU");
-    if (force_stage && std::strcmp(force_stage, "1") == 0) {
-        struct ggml_tensor* staged = ggml_dup(ctx, x_2d);
-        ggml_set_name(staged, "classifier_stage_cpu");
-        x_2d = staged;
-        maybe_dump_tensor_meta(x_2d, "classifier_x_2d_staged");
-    }
-
-    maybe_dump_tensor_meta(weight, "classifier_weight_used");
 
     struct ggml_tensor* logits_2d = ggml_mul_mat(ctx, weight, x_2d);
     ggml_set_name(logits_2d, "classifier_mm");
-    maybe_dump_tensor_meta(logits_2d, "classifier_logits_2d");
     logits_2d = ggml_add(ctx, logits_2d, bias);
     
     struct ggml_tensor* probs = ggml_soft_max(ctx, logits_2d);
@@ -1500,10 +939,7 @@ struct ggml_cgraph* build_graph(
 // Inference (Phase 5: Backend Scheduler)
 // ============================================================================
 
-static bool s_profile_enabled = false;
-
-void model_enable_profile(bool enable) {
-    s_profile_enabled = enable;
+void model_enable_profile(bool /* enable */) {
 }
 
 bool model_infer(
@@ -1532,9 +968,6 @@ bool model_infer(
         return false;
     }
 
-    maybe_dump_backend_assignment_ratio(state, graph);
-    maybe_dump_classifier_backend_map(state, graph);
-    
     auto prof_alloc_done = std::chrono::high_resolution_clock::now();
     
     struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "waveform");
@@ -1559,30 +992,6 @@ bool model_infer(
     lstm_reset_profile();
     lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
     
-    if (state.backend_stats) {
-        ggml_backend_sched_split_graph(state.sched, graph);
-        int n_nodes = ggml_graph_n_nodes(graph);
-        int n_cpu = 0;
-        int n_gpu = 0;
-        for (int i = 0; i < n_nodes; ++i) {
-            struct ggml_tensor* node = ggml_graph_node(graph, i);
-            ggml_backend_t b = ggml_backend_sched_get_tensor_backend(state.sched, node);
-            if (!b) {
-                continue;
-            }
-            ggml_backend_dev_t dev = ggml_backend_get_device(b);
-            enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-            if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                n_gpu++;
-            } else if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                n_cpu++;
-            }
-        }
-        state.last_nodes_total = n_nodes;
-        state.last_nodes_cpu = n_cpu;
-        state.last_nodes_gpu = n_gpu;
-    }
-
     if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ERROR: Graph computation failed\n");
         ggml_backend_sched_reset(state.sched);
@@ -1603,62 +1012,16 @@ bool model_infer(
     size_t copy_bytes = (output_bytes < requested_bytes) ? output_bytes : requested_bytes;
     ggml_backend_tensor_get(output_tensor, output, 0, copy_bytes);
 
-    if (const char* dump_dir = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_DIR")) {
-        int dump_max = 1;
-        if (const char* dump_max_env = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_MAX")) {
-            int parsed = std::atoi(dump_max_env);
-            if (parsed > 0) {
-                dump_max = parsed;
-            }
-        }
-
-        if (state.infer_call_index < dump_max) {
-            dump_tensor_binary(graph, "linear1_mm", dump_dir, state.infer_call_index);
-            dump_tensor_binary(graph, "linear2_mm", dump_dir, state.infer_call_index);
-            dump_tensor_binary(graph, "classifier_mm", dump_dir, state.infer_call_index);
-            dump_tensor_binary(graph, "classifier_out", dump_dir, state.infer_call_index);
-            dump_tensor_binary(graph, "lstm_out_cont", dump_dir, state.infer_call_index);
-            dump_classifier_mm_inputs(graph, dump_dir, state.infer_call_index);
-            dump_selected_graph_nodes(graph, dump_dir, state.infer_call_index);
-
-            char dump_path[1024];
-            std::snprintf(dump_path,
-                          sizeof(dump_path),
-                          "%s/seg_logits_%s_%04d.bin",
-                          dump_dir,
-                          state.experimental_gpu_partition_mode.c_str(),
-                          state.infer_call_index);
-            std::ofstream out(dump_path, std::ios::binary);
-            if (out.good()) {
-                out.write(reinterpret_cast<const char*>(output), (std::streamsize)copy_bytes);
-            }
-        }
-    }
-
     ggml_backend_sched_reset(state.sched);
-
-    state.infer_call_index++;
     
     auto prof_end = std::chrono::high_resolution_clock::now();
-    
-    if (s_profile_enabled) {
-        typedef std::chrono::high_resolution_clock::time_point tp;
-        auto to_ms = [](tp a, tp b) -> double { return std::chrono::duration<double, std::milli>(b - a).count(); };
-        printf("\n  model_infer profile:\n");
-        printf("    build_graph:   %6.2f ms\n", to_ms(prof_start, prof_graph_built));
-        printf("    alloc_graph:   %6.2f ms\n", to_ms(prof_graph_built, prof_alloc_done));
-        printf("    set_inputs:    %6.2f ms\n", to_ms(prof_alloc_done, prof_input_set));
-        printf("    graph_compute: %6.2f ms\n", to_ms(prof_input_set, prof_compute_done));
-        printf("    get_output:    %6.2f ms\n", to_ms(prof_compute_done, prof_end));
-        printf("    TOTAL:         %6.2f ms\n", to_ms(prof_start, prof_end));
-        lstm_print_profile();
-    }
     
     return true;
 }
 
 void state_set_backend_stats(segmentation_state& state, bool enable) {
-    state.backend_stats = enable;
+    (void) state;
+    (void) enable;
 }
 
 // ============================================================================

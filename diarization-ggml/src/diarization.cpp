@@ -333,14 +333,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     } else
 #endif
     {
-        // Default: keep segmentation weights on CPU for safety.
-        // Full-GPU experiments can override via DIARIZATION_SEG_WEIGHT_BACKEND=cuda.
-        std::string seg_weight_backend =
-            (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
-        if (const char* wb = std::getenv("DIARIZATION_SEG_WEIGHT_BACKEND"); wb && wb[0]) {
-            seg_weight_backend = wb;
-            fprintf(stderr, "[backend] segmentation weight backend override=%s\n", seg_weight_backend.c_str());
-        }
+        const std::string seg_weight_backend = config.ggml_backend;
 
         if (!segmentation::model_load(config.seg_model_path,
                                       seg_model,
@@ -359,23 +352,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             segmentation::model_free(seg_model);
             return false;
         }
-        if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
-            std::string mode = m;
-            if (mode == "classifier" || mode == "linear" || mode == "all") {
-                seg_state.experimental_gpu_partition = true;
-                seg_state.experimental_gpu_partition_mode = mode;
-                fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());
-            }
-        } else if (const char* v = std::getenv("DIARIZATION_SEG_GPU_PARTITION"); v && std::strcmp(v, "1") == 0) {
-            seg_state.experimental_gpu_partition = true;
-            seg_state.experimental_gpu_partition_mode = "linear";
-            fprintf(stderr, "[backend] segmentation experimental GPU partition mode=linear\n");
-        }
-        bool seg_stats_ok = (config.ggml_backend != "cuda");
-        if (const char* v = std::getenv("DIARIZATION_SEG_BACKEND_STATS"); v && std::strcmp(v, "1") == 0) {
-            seg_stats_ok = true;
-        }
-        segmentation::state_set_backend_stats(seg_state, seg_stats_ok);
+        segmentation::state_set_backend_stats(seg_state, (config.ggml_backend != "cuda"));
     }
     
     t_stage_end = Clock::now();
@@ -535,15 +512,6 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                         }
                     }
                 }
-            }
-
-            if (seg_state.backend_stats && c == num_chunks - 1 && seg_state.last_nodes_total > 0) {
-                fprintf(stderr,
-                        "\n[backend] segmentation nodes total=%d gpu=%d cpu=%d gpu_ratio=%.1f%%\n",
-                        seg_state.last_nodes_total,
-                        seg_state.last_nodes_gpu,
-                        seg_state.last_nodes_cpu,
-                        100.0 * (double) seg_state.last_nodes_gpu / (double) seg_state.last_nodes_total);
             }
 
             if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {

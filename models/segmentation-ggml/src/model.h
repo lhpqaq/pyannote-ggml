@@ -26,10 +26,8 @@ constexpr int LSTM_LAYERS = 4;
 constexpr int LINEAR_LAYERS = 2;
 
 // Maximum graph nodes.
-// Kept larger to allow experimental non-custom LSTM graph expansion under debug env flags.
-// The non-custom LSTM path unrolls time steps and can exceed 100k nodes.
-// Keep this large enough to avoid ggml graph build asserts.
-constexpr int MAX_GRAPH_NODES = 262144;
+// The production graph is small (tens to low-hundreds of nodes).
+constexpr int MAX_GRAPH_NODES = 8192;
 
 /**
  * @struct segmentation_hparams
@@ -151,15 +149,7 @@ struct segmentation_state {
     std::vector<uint8_t> graph_meta;
     lstm_weight_cache lstm_cache;
 
-    // Optional backend hit statistics for last graph
-    bool backend_stats = false;
-    int last_nodes_total = 0;
-    int last_nodes_gpu = 0;
-    int last_nodes_cpu = 0;
     bool printed_gpu_coverage = false;
-    bool experimental_gpu_partition = false;
-    std::string experimental_gpu_partition_mode = "off";
-    int infer_call_index = 0;
 };
 
 // ============================================================================

@@ -10,11 +10,6 @@ fi
 AUDIO_PATH="$1"
 BACKEND="$2"
 OUTPUT_PATH="${3:-}"
-export DIARIZATION_DEBUG_BACKEND_ASSIGN_RATIO=1 
-# export DIARIZATION_SEG_FORCE_ALL_GPU=1
-# export  DIARIZATION_SEG_LSTM_NOCUSTOM_DEBUG=1
-export DIARIZATION_SEG_WEIGHT_BACKEND=cuda
-export DIARIZATION_SEG_OP_GAP=1
 case "$BACKEND" in
     auto|cpu|metal|cuda) ;;
     *)
@@ -82,19 +77,6 @@ if [ -n "$OUTPUT_PATH" ]; then
     echo "  output:  $OUTPUT_PATH"
 else
     echo "  output:  stdout"
-fi
-
-if [ -n "${SEG_GPU_PARTITION_MODE:-}" ]; then
-    case "$SEG_GPU_PARTITION_MODE" in
-        classifier|linear|all)
-            export DIARIZATION_SEG_GPU_PARTITION_MODE="$SEG_GPU_PARTITION_MODE"
-            echo "  seg-gpu-partition: $SEG_GPU_PARTITION_MODE"
-            ;;
-        *)
-            echo "Error: SEG_GPU_PARTITION_MODE must be classifier|linear|all" >&2
-            exit 1
-            ;;
-    esac
 fi
 
 "${CMD[@]}"
