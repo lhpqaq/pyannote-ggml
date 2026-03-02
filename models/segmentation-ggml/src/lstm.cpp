@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -112,31 +113,46 @@ static void lstm_bidirectional_custom_op(
     int ith, int nth,
     void* userdata) {
 
-    (void)nth;
     auto* params = (lstm_bidir_params*)userdata;
     struct ggml_tensor* input = dst->src[0];
     int hidden_size = params->hidden_size;
-    bool reverse = (ith == 1);
 
-    const float* w_ih = reverse ? params->cached_w_ih_rev : params->cached_w_ih_fwd;
-    const float* w_hh = reverse ? params->cached_w_hh_rev : params->cached_w_hh_fwd;
-    float* ih_buf = reverse ? params->ih_all_buf_rev : params->ih_all_buf_fwd;
+    auto run_one = [&](bool reverse) {
+        const float* w_ih = reverse ? params->cached_w_ih_rev : params->cached_w_ih_fwd;
+        const float* w_hh = reverse ? params->cached_w_hh_rev : params->cached_w_hh_fwd;
+        float* ih_buf = reverse ? params->ih_all_buf_rev : params->ih_all_buf_fwd;
 
-    int fwd_bias_idx = 3;
-    int rev_bias_idx = 7;
-    float* bias_ih = (float*)dst->src[reverse ? rev_bias_idx : fwd_bias_idx]->data;
-    float* bias_hh = (float*)dst->src[reverse ? (rev_bias_idx + 1) : (fwd_bias_idx + 1)]->data;
+        const int fwd_bias_idx = 3;
+        const int rev_bias_idx = 7;
+        float* bias_ih = (float*)dst->src[reverse ? rev_bias_idx : fwd_bias_idx]->data;
+        float* bias_hh = (float*)dst->src[reverse ? (rev_bias_idx + 1) : (fwd_bias_idx + 1)]->data;
 
-    lstm_compute_one_direction(
-        (float*)dst->data, ith * hidden_size,
-        (float*)input->data,
-        input->ne[0], input->ne[1],
-        hidden_size, reverse,
-        w_ih, w_hh,
-        bias_ih, bias_hh,
-        dst->src[reverse ? 5 : 1],
-        dst->src[reverse ? 6 : 2],
-        ih_buf);
+        lstm_compute_one_direction(
+            (float*)dst->data, reverse ? hidden_size : 0,
+            (float*)input->data,
+            input->ne[0], input->ne[1],
+            hidden_size, reverse,
+            w_ih, w_hh,
+            bias_ih, bias_hh,
+            dst->src[reverse ? 5 : 1],
+            dst->src[reverse ? 6 : 2],
+            ih_buf);
+    };
+
+    if (nth <= 1) {
+        if (ith != 0) {
+            return;
+        }
+        run_one(false);
+        run_one(true);
+        return;
+    }
+
+    if (ith == 0) {
+        run_one(false);
+    } else if (ith == 1) {
+        run_one(true);
+    }
 }
 
 static lstm_bidir_params s_bidir_params[4];
@@ -238,12 +254,20 @@ struct ggml_tensor* lstm_layer_bidirectional(
         weight_ih_rev, weight_hh_rev, bias_ih_rev, bias_hh_rev
     };
     
+    int lstm_tasks = 2;
+    if (const char* env = std::getenv("DIARIZATION_SEG_LSTM_TASKS")) {
+        int parsed = std::atoi(env);
+        if (parsed > 0) {
+            lstm_tasks = parsed;
+        }
+    }
+
     struct ggml_tensor* output = ggml_custom_4d(
         ctx, GGML_TYPE_F32,
         seq_len, 2 * hidden_size, batch, 1,
         args, 9,
         lstm_bidirectional_custom_op,
-        2, params);
+        lstm_tasks, params);
     
     return output;
 }
