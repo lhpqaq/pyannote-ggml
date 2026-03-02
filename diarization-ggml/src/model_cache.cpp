@@ -61,14 +61,11 @@ ModelCache* model_cache_load(const ModelCacheConfig& config) {
             delete cache;
             return nullptr;
         }
-        bool seg_stats_ok = (config.ggml_backend != "cuda");
-        if (const char* v = std::getenv("DIARIZATION_SEG_BACKEND_STATS"); v && std::strcmp(v, "1") == 0) {
-            seg_stats_ok = true;
-        }
+        const bool seg_stats_ok = (config.ggml_backend != "cuda");
         segmentation::state_set_backend_stats(cache->seg_state, seg_stats_ok);
         if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
             std::string mode = m;
-            if (mode == "classifier" || mode == "linear" || mode == "all") {
+            if (mode == "classifier" || mode == "linear" || mode == "linear-only" || mode == "all") {
                 cache->seg_state.experimental_gpu_partition = true;
                 cache->seg_state.experimental_gpu_partition_mode = mode;
                 fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());

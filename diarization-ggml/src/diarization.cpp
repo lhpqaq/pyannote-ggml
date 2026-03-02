@@ -359,7 +359,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         }
         if (const char* m = std::getenv("DIARIZATION_SEG_GPU_PARTITION_MODE")) {
             std::string mode = m;
-            if (mode == "classifier" || mode == "linear" || mode == "all") {
+            if (mode == "classifier" || mode == "linear" || mode == "linear-only" || mode == "all") {
                 seg_state.experimental_gpu_partition = true;
                 seg_state.experimental_gpu_partition_mode = mode;
                 fprintf(stderr, "[backend] segmentation experimental GPU partition mode=%s\n", mode.c_str());
@@ -369,10 +369,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             seg_state.experimental_gpu_partition_mode = "linear";
             fprintf(stderr, "[backend] segmentation experimental GPU partition mode=linear\n");
         }
-        bool seg_stats_ok = (config.ggml_backend != "cuda");
-        if (const char* v = std::getenv("DIARIZATION_SEG_BACKEND_STATS"); v && std::strcmp(v, "1") == 0) {
-            seg_stats_ok = true;
-        }
+        const bool seg_stats_ok = (config.ggml_backend != "cuda");
         segmentation::state_set_backend_stats(seg_state, seg_stats_ok);
     }
     
@@ -627,79 +624,71 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         fprintf(stderr, "Speaker count: max %d speakers, %d frames [%.0f ms]\n",
                 max_count, total_frames, t_speaker_count_ms);
 
+        // ================================================================
+        // Step 8: Extract embeddings
+        // (num_chunks, 3, 256)
+        // ================================================================
+
+        t_stage_start = Clock::now();
+        std::vector<float> embeddings(
+            static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
+
+        fprintf(stderr, "Embeddings: %d chunks... ", num_chunks);
+        fflush(stderr);
+        if (!extract_embeddings(
+                audio, n_samples,
+                binarized.data(), num_chunks, FRAMES_PER_CHUNK, NUM_LOCAL_SPEAKERS,
+                coreml_ctx,
+                use_emb_coreml ? nullptr : &emb_model,
+                use_emb_coreml ? nullptr : &emb_state,
+                embeddings.data())) {
+            fprintf(stderr, "Error: embedding extraction failed\n");
+            goto cleanup;
+        }
+        
+        t_stage_end = Clock::now();
+        t_embeddings_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
+        fprintf(stderr, "done [%.0f ms]\n", t_embeddings_ms);
+
+        // Free embedding model — no longer needed
+        if (coreml_ctx) {
+#ifdef EMBEDDING_USE_COREML
+            embedding_coreml_free(coreml_ctx);
+            coreml_ctx = nullptr;
+#endif
+        } else {
+            embedding::state_free(emb_state);
+            embedding::model_free(emb_model);
+            emb_state.sched = nullptr;
+            emb_model.ctx = nullptr;
+        }
+
+
+        // ================================================================
+        // Step 9: Filter embeddings
+        // ================================================================
+
+        t_stage_start = Clock::now();
+        std::vector<float> filtered_emb;
+        std::vector<int> filt_chunk_idx, filt_speaker_idx;
+        diarization::filter_embeddings(
+            embeddings.data(), num_chunks, NUM_LOCAL_SPEAKERS, EMBEDDING_DIM,
+            binarized.data(), FRAMES_PER_CHUNK,
+            filtered_emb, filt_chunk_idx, filt_speaker_idx);
+
+        const int num_filtered = static_cast<int>(filt_chunk_idx.size());
+        fprintf(stderr, "Filter: %d embeddings ", num_filtered);
+        fflush(stderr);
+
+        // ================================================================
+        // Steps 10-17: Clustering + assignment
+        // ================================================================
+
         std::vector<int> hard_clusters(
             static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS, 0);
         int num_clusters = 1;
 
-        if (config.bypass_embeddings) {
-            fprintf(stderr, "Embeddings: bypassed (segmentation-only assignment)\n");
-            num_clusters = NUM_LOCAL_SPEAKERS;
-            for (int c = 0; c < num_chunks; c++) {
-                for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) {
-                    hard_clusters[c * NUM_LOCAL_SPEAKERS + s] = s;
-                }
-            }
-        } else {
-            // ================================================================
-            // Step 8: Extract embeddings
-            // (num_chunks, 3, 256)
-            // ================================================================
-
-            t_stage_start = Clock::now();
-            std::vector<float> embeddings(
-                static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
-
-            fprintf(stderr, "Embeddings: %d chunks... ", num_chunks);
-            fflush(stderr);
-            if (!extract_embeddings(
-                    audio, n_samples,
-                    binarized.data(), num_chunks, FRAMES_PER_CHUNK, NUM_LOCAL_SPEAKERS,
-                    coreml_ctx,
-                    use_emb_coreml ? nullptr : &emb_model,
-                    use_emb_coreml ? nullptr : &emb_state,
-                    embeddings.data())) {
-                fprintf(stderr, "Error: embedding extraction failed\n");
-                goto cleanup;
-            }
-
-            t_stage_end = Clock::now();
-            t_embeddings_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
-            fprintf(stderr, "done [%.0f ms]\n", t_embeddings_ms);
-
-            // Free embedding model — no longer needed
-            if (coreml_ctx) {
-#ifdef EMBEDDING_USE_COREML
-                embedding_coreml_free(coreml_ctx);
-                coreml_ctx = nullptr;
-#endif
-            } else {
-                embedding::state_free(emb_state);
-                embedding::model_free(emb_model);
-                emb_state.sched = nullptr;
-                emb_model.ctx = nullptr;
-            }
-
-            // ================================================================
-            // Step 9: Filter embeddings
-            // ================================================================
-
-            t_stage_start = Clock::now();
-            std::vector<float> filtered_emb;
-            std::vector<int> filt_chunk_idx, filt_speaker_idx;
-            diarization::filter_embeddings(
-                embeddings.data(), num_chunks, NUM_LOCAL_SPEAKERS, EMBEDDING_DIM,
-                binarized.data(), FRAMES_PER_CHUNK,
-                filtered_emb, filt_chunk_idx, filt_speaker_idx);
-
-            const int num_filtered = static_cast<int>(filt_chunk_idx.size());
-            fprintf(stderr, "Filter: %d embeddings ", num_filtered);
-            fflush(stderr);
-
-            // ================================================================
-            // Steps 10-17: Clustering + assignment
-            // ================================================================
-
-            if (num_filtered < 2) {
+        if (num_filtered < 2) {
             t_stage_end = Clock::now();
             t_filter_plda_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
             fprintf(stderr, "[%.0f ms]\n", t_filter_plda_ms);
@@ -707,7 +696,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             // Too few embeddings — assign all to single cluster
             fprintf(stderr, "Too few embeddings for clustering, using single cluster\n");
 
-            } else {
+        } else {
             // Step 11: L2-normalize filtered embeddings (for AHC)
             std::vector<double> filtered_normed(
                 static_cast<size_t>(num_filtered) * EMBEDDING_DIM);
@@ -852,7 +841,6 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             diarization::constrained_argmax(
                 soft_clusters.data(), num_chunks, NUM_LOCAL_SPEAKERS, num_clusters,
                 hard_clusters);
-            }
         }
 
         // Step 17: Mark inactive speakers as -2

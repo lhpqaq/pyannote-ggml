@@ -20,7 +20,6 @@ static void print_usage(const char* program) {
     fprintf(stderr, "  --gpu-device <id>     GPU device index for CUDA backend\n");
     fprintf(stderr, "  -o, --output <path>   Output RTTM file (default: stdout)\n");
     fprintf(stderr, "  --dump-stage <name>   Dump intermediate stage to binary file\n");
-    fprintf(stderr, "  --bypass-embeddings   Skip embeddings/clustering (for validation only)\n");
     fprintf(stderr, "  --help                Print this help message\n");
 }
 
@@ -62,8 +61,6 @@ int main(int argc, char** argv) {
             config.output_path = argv[++i];
         } else if (arg == "--dump-stage" && i + 1 < argc) {
             config.dump_stage = argv[++i];
-        } else if (arg == "--bypass-embeddings") {
-            config.bypass_embeddings = true;
         } else if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
