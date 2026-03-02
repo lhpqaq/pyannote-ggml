@@ -1,0 +1,722 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OpenCode <noreply@example.com>
+Date: 2026-03-03
+Subject: [PATCH] ggml-cuda: add optional cuDNN support and pyannote LSTM path
+
+This is an experimental patch to integrate cuDNN into ggml-cuda and add a
+cuDNN-based forward-inference path for the pyannote segmentation BiLSTM custom op.
+
+Build-time:
+- Adds CMake option GGML_CUDA_CUDNN (OFF by default) to link libcudnn and include cudnn.h.
+
+Runtime (only when built with GGML_CUDA_CUDNN=ON):
+- GGML_CUDA_PYANNOTE_LSTM_CUDNN=1 to enable cuDNN path
+- GGML_CUDA_PYANNOTE_LSTM_CUDNN_FORCE=1 to abort on failure (no silent fallback)
+- GGML_CUDA_PYANNOTE_LSTM_CUDNN_VERBOSE=1 to print debug logs
+- GGML_CUDA_PYANNOTE_LSTM_CUDNN_BIAS=1 to enable experimental bias packing
+
+NOTE: Not intended for default enablement; kept for archival/reference.
+---
+diff --git a/ggml/src/ggml-cuda/CMakeLists.txt b/ggml/src/ggml-cuda/CMakeLists.txt
+index d313c1ac..379351e4 100644
+--- a/ggml/src/ggml-cuda/CMakeLists.txt
++++ b/ggml/src/ggml-cuda/CMakeLists.txt
+@@ -125,9 +125,34 @@ if (CUDAToolkit_FOUND)
+     endif()
+ 
+     ggml_add_backend_library(ggml-cuda
+-                             ${GGML_HEADERS_CUDA}
+-                             ${GGML_SOURCES_CUDA}
+-                            )
++                              ${GGML_HEADERS_CUDA}
++                              ${GGML_SOURCES_CUDA}
++                             )
++
++    # Optional cuDNN support (OFF by default).
++    # This repo can use cuDNN for some custom CUDA paths (e.g. LSTM experiments).
++    option(GGML_CUDA_CUDNN "ggml: use cuDNN (if available)" OFF)
++    if (GGML_CUDA_CUDNN)
++        find_path(CUDNN_INCLUDE_DIR cudnn.h
++            PATHS
++                /usr/include
++                /usr/local/cuda/include
++                ${CUDAToolkit_INCLUDE_DIRS}
++        )
++        find_library(CUDNN_LIBRARY NAMES cudnn libcudnn
++            PATHS
++                /usr/lib/x86_64-linux-gnu
++                /usr/local/cuda/lib64
++                ${CUDAToolkit_LIBRARY_DIR}
++        )
++        if (NOT CUDNN_INCLUDE_DIR OR NOT CUDNN_LIBRARY)
++            message(FATAL_ERROR "GGML_CUDA_CUDNN=ON but cuDNN was not found (need cudnn.h + libcudnn)")
++        endif()
++
++        target_include_directories(ggml-cuda PRIVATE ${CUDNN_INCLUDE_DIR})
++        target_link_libraries(ggml-cuda PRIVATE ${CUDNN_LIBRARY})
++        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_CUDNN)
++    endif()
+ 
+     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2963fcb5..974812bf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -66,10 +66,630 @@
+ // Pyannote segmentation custom-op CUDA support
+ #include <cuda_fp16.h>
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++#include <cudnn.h>
++#include <mutex>
++#include <unordered_map>
++#endif
++
+ // ============================================================================
+ // Pyannote segmentation: CUDA fast-path for GGML_OP_CUSTOM BiLSTM
+ // ============================================================================
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++static bool ggml_cuda_pyannote_lstm_use_cudnn() {
++    const char * env = getenv("GGML_CUDA_PYANNOTE_LSTM_CUDNN");
++    return env && atoi(env) == 1;
++}
++
++static bool ggml_cuda_pyannote_lstm_cudnn_force() {
++    const char * env = getenv("GGML_CUDA_PYANNOTE_LSTM_CUDNN_FORCE");
++    return env && atoi(env) == 1;
++}
++
++static bool ggml_cuda_pyannote_lstm_cudnn_pack_biases() {
++    // Default OFF for safety: cuDNN bias mapping must be verified.
++    // Enable with GGML_CUDA_PYANNOTE_LSTM_CUDNN_BIAS=1.
++    const char * env = getenv("GGML_CUDA_PYANNOTE_LSTM_CUDNN_BIAS");
++    return env && atoi(env) == 1;
++}
++
++static bool ggml_cuda_pyannote_lstm_cudnn_verbose() {
++    const char * env = getenv("GGML_CUDA_PYANNOTE_LSTM_CUDNN_VERBOSE");
++    return env && atoi(env) == 1;
++}
++
++static const char * ggml_cudnn_get_error_string(cudnnStatus_t status) {
++    return cudnnGetErrorString(status);
++}
++
++#define CUDNN_CHECK_RET(expr) do { \
++    const cudnnStatus_t _st = (expr); \
++    if (_st != CUDNN_STATUS_SUCCESS) { \
++        fprintf(stderr, "cuDNN error %d: %s (%s:%d: %s)\n", (int) _st, ggml_cudnn_get_error_string(_st), __FILE__, __LINE__, #expr); \
++        return false; \
++    } \
++} while (0)
++
++template <bool REVERSE>
++static __global__ void k_f32_tmajor_to_f16_cudnn_layout(const int T, const int C, const float * x, half * y) {
++    const int idx = (int) (blockIdx.x * blockDim.x + threadIdx.x);
++    const int n = T * C;
++    if (idx >= n) {
++        return;
++    }
++    const int t0 = idx / C;
++    const int c  = idx - t0 * C;
++    const int t  = REVERSE ? (T - 1 - t0) : t0;
++    const float v = x[t0 + (int) ((int64_t) T * c)];
++    y[t * C + c] = __float2half_rn(v);
++}
++
++template <bool REVERSE>
++static __global__ void k_f16_cudnn_layout_to_f32_tmajor(const int T, const int C, const half * x, float * y, const int dst_off) {
++    const int idx = (int) (blockIdx.x * blockDim.x + threadIdx.x);
++    const int n = T * C;
++    if (idx >= n) {
++        return;
++    }
++    const int t0 = idx / C;
++    const int c  = idx - t0 * C;
++    const int t  = REVERSE ? (T - 1 - t0) : t0;
++    y[(dst_off + c) * T + t] = __half2float(x[t0 * C + c]);
++}
++
++template <typename T>
++static __device__ __forceinline__ float cudnn_load_f32(const T * p, int idx);
++
++template <>
++__device__ __forceinline__ float cudnn_load_f32<float>(const float * p, int idx) {
++    return p[idx];
++}
++
++template <>
++__device__ __forceinline__ float cudnn_load_f32<half>(const half * p, int idx) {
++    return __half2float(p[idx]);
++}
++
++// Write a 2D matrix into a cuDNN-provided tensor view with arbitrary element strides.
++// The destination is assumed to be FP16.
++template <typename SRC_T>
++static __global__ void k_pack_cudnn_w(
++    const int rows,
++    const int cols,
++    const int64_t dst_s0,
++    const int64_t dst_s1,
++    half * dst,
++    const SRC_T * src,
++    const int64_t src_s0,
++    const int64_t src_s1) {
++
++    const int idx = (int) (blockIdx.x * blockDim.x + threadIdx.x);
++    const int n = rows * cols;
++    if (idx >= n) {
++        return;
++    }
++    const int r = idx / cols;
++    const int c = idx - r * cols;
++
++    const float v = cudnn_load_f32<SRC_T>(src, (int) (r * src_s0 + c * src_s1));
++    dst[(int64_t) r * dst_s0 + (int64_t) c * dst_s1] = __float2half_rn(v);
++}
++
++template <typename SRC_T>
++static __global__ void k_pack_cudnn_b(
++    const int n,
++    const int64_t dst_s0,
++    half * dst,
++    const SRC_T * src,
++    const int src_off) {
++
++    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
++    if (i >= n) {
++        return;
++    }
++    const float v = cudnn_load_f32<SRC_T>(src, src_off + i);
++    dst[(int64_t) i * dst_s0] = __float2half_rn(v);
++}
++
++struct pyannote_cudnn_lstm_cache {
++    int T = 0;
++    int input_size = 0;
++    int hidden_size = 0;
++
++    cudnnHandle_t handle = nullptr;
++    cudnnRNNDescriptor_t rnn_desc = nullptr;
++    cudnnDropoutDescriptor_t dropout_desc = nullptr;
++    void * dropout_states = nullptr;
++    size_t dropout_state_bytes = 0;
++    cudnnRNNDataDescriptor_t x_desc = nullptr;
++    cudnnRNNDataDescriptor_t y_desc = nullptr;
++    cudnnTensorDescriptor_t hx_desc = nullptr;
++    cudnnTensorDescriptor_t cx_desc = nullptr;
++
++    // Per-linear-layer descriptors required by cudnnGetRNNWeightParams.
++    cudnnTensorDescriptor_t w_desc[8] = { nullptr };
++    cudnnTensorDescriptor_t b_desc[8] = { nullptr };
++
++    // Device sequence lengths array (N=1)
++    int32_t * dev_seq_lengths = nullptr;
++
++    void * weight_space_d = nullptr;
++    size_t weight_space_bytes = 0;
++    size_t workspace_bytes = 0;
++
++    const void * w_ih_d = nullptr;
++    const void * w_hh_d = nullptr;
++    const void * b_ih_d = nullptr;
++    const void * b_hh_d = nullptr;
++    int bias_type = 0;
++
++    ~pyannote_cudnn_lstm_cache() {
++        if (weight_space_d) {
++            cudaFree(weight_space_d);
++        }
++        if (dev_seq_lengths) {
++            cudaFree(dev_seq_lengths);
++        }
++        if (dropout_states) {
++            cudaFree(dropout_states);
++        }
++        if (dropout_desc) {
++            cudnnDestroyDropoutDescriptor(dropout_desc);
++        }
++        if (hx_desc) cudnnDestroyTensorDescriptor(hx_desc);
++        if (cx_desc) cudnnDestroyTensorDescriptor(cx_desc);
++        for (int i = 0; i < 8; ++i) {
++            if (w_desc[i]) cudnnDestroyTensorDescriptor(w_desc[i]);
++            if (b_desc[i]) cudnnDestroyTensorDescriptor(b_desc[i]);
++        }
++        if (x_desc)  cudnnDestroyRNNDataDescriptor(x_desc);
++        if (y_desc)  cudnnDestroyRNNDataDescriptor(y_desc);
++        if (rnn_desc) cudnnDestroyRNNDescriptor(rnn_desc);
++        if (handle)  cudnnDestroy(handle);
++    }
++};
++
++static std::mutex g_pyannote_cudnn_mutex;
++static std::unordered_map<const void *, pyannote_cudnn_lstm_cache *> g_pyannote_cudnn_cache;
++
++static pyannote_cudnn_lstm_cache * pyannote_cudnn_get_cache(const void * key) {
++    std::lock_guard<std::mutex> lock(g_pyannote_cudnn_mutex);
++    auto it = g_pyannote_cudnn_cache.find(key);
++    if (it != g_pyannote_cudnn_cache.end()) {
++        return it->second;
++    }
++    pyannote_cudnn_lstm_cache * c = new pyannote_cudnn_lstm_cache();
++    g_pyannote_cudnn_cache[key] = c;
++    return c;
++}
++
++static bool pyannote_cudnn_prepare(
++    pyannote_cudnn_lstm_cache & cache,
++    ggml_backend_cuda_context & ctx,
++    int T,
++    int input_size,
++    int hidden_size,
++    const ggml_tensor * w_ih,
++    const ggml_tensor * w_hh,
++    const ggml_tensor * b_ih,
++    const ggml_tensor * b_hh) {
++
++    if (cache.handle == nullptr) {
++        CUDNN_CHECK_RET(cudnnCreate(&cache.handle));
++    }
++
++    CUDNN_CHECK_RET(cudnnSetStream(cache.handle, ctx.stream()));
++
++    const bool need_desc = (cache.rnn_desc == nullptr || cache.T != T || cache.input_size != input_size || cache.hidden_size != hidden_size);
++    if (need_desc) {
++        if (cache.rnn_desc) cudnnDestroyRNNDescriptor(cache.rnn_desc);
++        if (cache.dropout_states) cudaFree(cache.dropout_states);
++        if (cache.dropout_desc) cudnnDestroyDropoutDescriptor(cache.dropout_desc);
++        cache.dropout_states = nullptr;
++        cache.dropout_desc = nullptr;
++        cache.dropout_state_bytes = 0;
++        if (cache.x_desc) cudnnDestroyRNNDataDescriptor(cache.x_desc);
++        if (cache.y_desc) cudnnDestroyRNNDataDescriptor(cache.y_desc);
++        if (cache.hx_desc) cudnnDestroyTensorDescriptor(cache.hx_desc);
++        if (cache.cx_desc) cudnnDestroyTensorDescriptor(cache.cx_desc);
++        for (int i = 0; i < 8; ++i) {
++            if (cache.w_desc[i]) cudnnDestroyTensorDescriptor(cache.w_desc[i]);
++            if (cache.b_desc[i]) cudnnDestroyTensorDescriptor(cache.b_desc[i]);
++            cache.w_desc[i] = nullptr;
++            cache.b_desc[i] = nullptr;
++        }
++        cache.rnn_desc = nullptr;
++        cache.x_desc = nullptr;
++        cache.y_desc = nullptr;
++        cache.hx_desc = nullptr;
++        cache.cx_desc = nullptr;
++
++        if (cache.weight_space_d) {
++            cudaFree(cache.weight_space_d);
++            cache.weight_space_d = nullptr;
++        }
++        if (cache.dev_seq_lengths) {
++            cudaFree(cache.dev_seq_lengths);
++            cache.dev_seq_lengths = nullptr;
++        }
++
++        cache.T = T;
++        cache.input_size = input_size;
++        cache.hidden_size = hidden_size;
++
++        CUDNN_CHECK_RET(cudnnCreateRNNDescriptor(&cache.rnn_desc));
++
++        CUDNN_CHECK_RET(cudnnCreateDropoutDescriptor(&cache.dropout_desc));
++        CUDNN_CHECK_RET(cudnnDropoutGetStatesSize(cache.handle, &cache.dropout_state_bytes));
++        if (cache.dropout_state_bytes > 0) {
++            CUDA_CHECK(cudaMalloc(&cache.dropout_states, cache.dropout_state_bytes));
++        }
++        CUDNN_CHECK_RET(cudnnSetDropoutDescriptor(cache.dropout_desc, cache.handle, 0.0f, cache.dropout_states, cache.dropout_state_bytes, 0));
++
++        const cudnnDataType_t data_type = CUDNN_DATA_HALF;
++        const cudnnDataType_t math_prec = CUDNN_DATA_FLOAT;
++        const cudnnMathType_t math_type = CUDNN_TENSOR_OP_MATH;
++            CUDNN_CHECK_RET(cudnnSetRNNDescriptor_v8(
++                cache.rnn_desc,
++                CUDNN_RNN_ALGO_STANDARD,
++                CUDNN_LSTM,
++            CUDNN_RNN_NO_BIAS,
++                CUDNN_UNIDIRECTIONAL,
++                CUDNN_LINEAR_INPUT,
++                data_type,
++                math_prec,
++                math_type,
++                input_size,
++                hidden_size,
++                hidden_size,
++                1,
++                cache.dropout_desc,
++                0));
++
++        CUDNN_CHECK_RET(cudnnCreateRNNDataDescriptor(&cache.x_desc));
++        CUDNN_CHECK_RET(cudnnCreateRNNDataDescriptor(&cache.y_desc));
++
++        std::vector<int> seq_len_arr(1, T);
++        CUDNN_CHECK_RET(cudnnSetRNNDataDescriptor(
++            cache.x_desc,
++            data_type,
++            CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED,
++            T,
++            1,
++            input_size,
++            seq_len_arr.data(),
++            nullptr));
++        CUDNN_CHECK_RET(cudnnSetRNNDataDescriptor(
++            cache.y_desc,
++            data_type,
++            CUDNN_RNN_DATA_LAYOUT_SEQ_MAJOR_UNPACKED,
++            T,
++            1,
++            hidden_size,
++            seq_len_arr.data(),
++            nullptr));
++
++        CUDNN_CHECK_RET(cudnnCreateTensorDescriptor(&cache.hx_desc));
++        CUDNN_CHECK_RET(cudnnCreateTensorDescriptor(&cache.cx_desc));
++
++        for (int i = 0; i < 8; ++i) {
++            CUDNN_CHECK_RET(cudnnCreateTensorDescriptor(&cache.w_desc[i]));
++            CUDNN_CHECK_RET(cudnnCreateTensorDescriptor(&cache.b_desc[i]));
++        }
++
++        // cuDNN RNN APIs commonly expect tensor descriptors padded to 5 dims.
++        // Use shape [1, 1, H, 1, 1] (numLayers*dir, batch, hidden, 1, 1).
++        int dims[5] = {1, 1, hidden_size, 1, 1};
++        int strides[5] = {
++            1 * 1 * hidden_size,
++            1 * hidden_size,
++            1,
++            1,
++            1,
++        };
++        // hx/cx use the same datatype as the input/output in v9 headers.
++        CUDNN_CHECK_RET(cudnnSetTensorNdDescriptor(cache.hx_desc, data_type, 5, dims, strides));
++        CUDNN_CHECK_RET(cudnnSetTensorNdDescriptor(cache.cx_desc, data_type, 5, dims, strides));
++
++        size_t weight_space_bytes = 0;
++        CUDNN_CHECK_RET(cudnnGetRNNWeightSpaceSize(cache.handle, cache.rnn_desc, &weight_space_bytes));
++        cache.weight_space_bytes = weight_space_bytes;
++        CUDA_CHECK(cudaMalloc(&cache.weight_space_d, cache.weight_space_bytes));
++
++        size_t workspace_size = 0;
++        size_t reserve_size = 0;
++        CUDNN_CHECK_RET(cudnnGetRNNTempSpaceSizes(cache.handle, cache.rnn_desc, CUDNN_FWD_MODE_INFERENCE, cache.x_desc, &workspace_size, &reserve_size));
++        cache.workspace_bytes = workspace_size;
++
++        // N=1: single sequence length value on device.
++        CUDA_CHECK(cudaMalloc(&cache.dev_seq_lengths, sizeof(int32_t)));
++    }
++
++    // Keep dev seq length in sync with T.
++    if (cache.dev_seq_lengths) {
++        const int32_t t32 = (int32_t) T;
++        CUDA_CHECK(cudaMemcpyAsync(cache.dev_seq_lengths, &t32, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
++    }
++
++    const bool need_repack =
++        cache.w_ih_d != w_ih->data ||
++        cache.w_hh_d != w_hh->data ||
++        cache.b_ih_d != b_ih->data ||
++        cache.b_hh_d != b_hh->data ||
++        cache.bias_type != (int) b_ih->type;
++
++    if (need_repack) {
++        const int H = hidden_size;
++        const int in_sz = input_size;
++        const int G = 4 * H;
++
++        for (int linear_id = 0; linear_id < 8; ++linear_id) {
++            cudnnTensorDescriptor_t mat_desc = cache.w_desc[linear_id];
++            cudnnTensorDescriptor_t bias_desc = cache.b_desc[linear_id];
++            void * mat_ptr = nullptr;
++            void * bias_ptr = nullptr;
++            CUDNN_CHECK_RET(cudnnGetRNNWeightParams(
++                cache.handle,
++                cache.rnn_desc,
++                0,
++                cache.weight_space_bytes,
++                cache.weight_space_d,
++                linear_id,
++                mat_desc,
++                &mat_ptr,
++                bias_desc,
++                &bias_ptr));
++
++            int nb_dims = 0;
++            int dims[5] = {0, 0, 0, 0, 0};
++            int strides[5] = {0, 0, 0, 0, 0};
++            cudnnDataType_t dt;
++            CUDNN_CHECK_RET(cudnnGetTensorNdDescriptor(mat_desc, 5, &dt, &nb_dims, dims, strides));
++
++            auto find_axis_eq = [&](int value, int skip) -> int {
++                for (int a = 0; a < nb_dims && a < 5; ++a) {
++                    if (a == skip) continue;
++                    if (dims[a] == value) return a;
++                }
++                return -1;
++            };
++
++            const int gate = linear_id & 3;
++            const bool is_ih = linear_id < 4;
++
++            int ax0 = -1;
++            int ax1 = -1;
++            if (is_ih) {
++                ax0 = find_axis_eq(H, -1);
++                ax1 = find_axis_eq(in_sz, ax0);
++            } else {
++                ax0 = find_axis_eq(H, -1);
++                ax1 = find_axis_eq(H, ax0);
++            }
++            if (ax0 < 0 || ax1 < 0) {
++                fprintf(stderr, "cuDNN LSTM: unexpected weight descriptor dims=[%d,%d,%d,%d,%d] (in=%d H=%d)\n",
++                        dims[0], dims[1], dims[2], dims[3], dims[4], in_sz, H);
++                return false;
++            }
++
++            const int rows = dims[ax0];
++            const int cols = dims[ax1];
++            const int64_t dst_s0 = (int64_t) strides[ax0];
++            const int64_t dst_s1 = (int64_t) strides[ax1];
++
++            // Pack matrix using the descriptor's element strides.
++            // Source is ggml layout: w_ih is (in_sz x 4H) column-major, w_hh is (H x 4H) column-major.
++            const int bs = 256;
++            const int gs = (rows * cols + bs - 1) / bs;
++            if (is_ih) {
++                const half * src = (const half *) w_ih->data;
++                if (rows == H && cols == in_sz) {
++                    // W_ih is [4H, in] in ggml: idx = row + (4H)*col
++                    // dst(r,c) = W_ih[gate*H + r, c]
++                    k_pack_cudnn_w<half><<<gs, bs, 0, ctx.stream()>>>(
++                        rows, cols,
++                        dst_s0, dst_s1,
++                        (half *) mat_ptr,
++                        src + (int64_t) (gate * H),
++                        1, (int64_t) (4 * H));
++                } else if (rows == in_sz && cols == H) {
++                    // dst(r,c) = W_ih^T[r, gate*H + c] = W_ih[gate*H + c, r]
++                    k_pack_cudnn_w<half><<<gs, bs, 0, ctx.stream()>>>(
++                        rows, cols,
++                        dst_s0, dst_s1,
++                        (half *) mat_ptr,
++                        src + (int64_t) (gate * H),
++                        (int64_t) (4 * H), 1);
++                } else {
++                    fprintf(stderr, "cuDNN LSTM: unexpected w_ih dims rows=%d cols=%d (in=%d H=%d)\n", rows, cols, in_sz, H);
++                    return false;
++                }
++            } else {
++                const half * src = (const half *) w_hh->data;
++                if (rows == H && cols == H) {
++                    // W_hh is [4H, H] in ggml: idx = row + (4H)*col
++                    // dst(r,c) = W_hh[gate*H + r, c]
++                    k_pack_cudnn_w<half><<<gs, bs, 0, ctx.stream()>>>(
++                        rows, cols,
++                        dst_s0, dst_s1,
++                        (half *) mat_ptr,
++                        src + (int64_t) (gate * H),
++                        1, (int64_t) (4 * H));
++                } else {
++                    fprintf(stderr, "cuDNN LSTM: unexpected w_hh dims rows=%d cols=%d (H=%d)\n", rows, cols, H);
++                    return false;
++                }
++            }
++            CUDA_CHECK(cudaGetLastError());
++
++            // Pack bias using descriptor's stride.
++            // Bias packing is optional; keep OFF by default until verified.
++            if (bias_ptr != nullptr && ggml_cuda_pyannote_lstm_cudnn_pack_biases()) {
++                nb_dims = 0;
++                std::fill(std::begin(dims), std::end(dims), 0);
++                std::fill(std::begin(strides), std::end(strides), 0);
++                CUDNN_CHECK_RET(cudnnGetTensorNdDescriptor(bias_desc, 5, &dt, &nb_dims, dims, strides));
++                if (ggml_cuda_pyannote_lstm_cudnn_verbose()) {
++                    fprintf(stderr, "[cudnn] bias desc id=%d dims=[%d,%d,%d,%d,%d] strides=[%d,%d,%d,%d,%d] nb=%d\n",
++                            linear_id,
++                            dims[0], dims[1], dims[2], dims[3], dims[4],
++                            strides[0], strides[1], strides[2], strides[3], strides[4],
++                            nb_dims);
++                }
++
++                int bax = find_axis_eq(H, -1);
++                if (bax < 0) {
++                    fprintf(stderr, "cuDNN LSTM: unexpected bias descriptor dims=[%d,%d,%d,%d,%d] (H=%d)\n",
++                            dims[0], dims[1], dims[2], dims[3], dims[4], H);
++                    return false;
++                }
++                const int bias_len = dims[bax];
++                const int64_t b_dst_s0 = (int64_t) strides[bax];
++                const int bgs = (bias_len + bs - 1) / bs;
++                if (is_ih) {
++                    if (b_ih->type == GGML_TYPE_F16) {
++                        k_pack_cudnn_b<half><<<bgs, bs, 0, ctx.stream()>>>(bias_len, b_dst_s0, (half *) bias_ptr, (const half *) b_ih->data, gate * H);
++                    } else {
++                        k_pack_cudnn_b<float><<<bgs, bs, 0, ctx.stream()>>>(bias_len, b_dst_s0, (half *) bias_ptr, (const float *) b_ih->data, gate * H);
++                    }
++                } else {
++                    if (b_hh->type == GGML_TYPE_F16) {
++                        k_pack_cudnn_b<half><<<bgs, bs, 0, ctx.stream()>>>(bias_len, b_dst_s0, (half *) bias_ptr, (const half *) b_hh->data, gate * H);
++                    } else {
++                        k_pack_cudnn_b<float><<<bgs, bs, 0, ctx.stream()>>>(bias_len, b_dst_s0, (half *) bias_ptr, (const float *) b_hh->data, gate * H);
++                    }
++                }
++                CUDA_CHECK(cudaGetLastError());
++            }
++        }
++
++        cache.w_ih_d = w_ih->data;
++        cache.w_hh_d = w_hh->data;
++        cache.b_ih_d = b_ih->data;
++        cache.b_hh_d = b_hh->data;
++        cache.bias_type = (int) b_ih->type;
++    }
++
++    return true;
++}
++
++static bool pyannote_cudnn_lstm_run_one_dir(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * x,
++    const ggml_tensor * w_ih,
++    const ggml_tensor * w_hh,
++    const ggml_tensor * b_ih,
++    const ggml_tensor * b_hh,
++    const int T,
++    const int in,
++    const int H,
++    const bool reverse,
++    float * dst,
++    const int dst_off) {
++
++    pyannote_cudnn_lstm_cache * cache = pyannote_cudnn_get_cache(w_ih->data);
++    if (!pyannote_cudnn_prepare(*cache, ctx, T, in, H, w_ih, w_hh, b_ih, b_hh)) {
++        return false;
++    }
++
++    ggml_cuda_pool_alloc<half> x_tmp(ctx.pool());
++    ggml_cuda_pool_alloc<half> y_tmp(ctx.pool());
++    ggml_cuda_pool_alloc<uint8_t> work(ctx.pool());
++    ggml_cuda_pool_alloc<half> hxcx(ctx.pool());
++
++    x_tmp.alloc((size_t) T * (size_t) in);
++    y_tmp.alloc((size_t) T * (size_t) H);
++    if (cache->workspace_bytes > 0) {
++        work.alloc(cache->workspace_bytes);
++    }
++    // Allocate hx, cx, hy, cy (each length H).
++    hxcx.alloc((size_t) 4 * (size_t) H);
++    half * hx = hxcx.get();
++    half * cx = hx + H;
++    half * hy = cx + H;
++    half * cy = hy + H;
++    CUDA_CHECK(cudaMemsetAsync(hx, 0, (size_t) H * sizeof(half), ctx.stream()));
++    CUDA_CHECK(cudaMemsetAsync(cx, 0, (size_t) H * sizeof(half), ctx.stream()));
++
++    {
++        const int n = T * in;
++        const int bs = 256;
++        const int gs = (n + bs - 1) / bs;
++        if (reverse) {
++            k_f32_tmajor_to_f16_cudnn_layout<true><<<gs, bs, 0, ctx.stream()>>>(T, in, (const float *) x->data, x_tmp.get());
++        } else {
++            k_f32_tmajor_to_f16_cudnn_layout<false><<<gs, bs, 0, ctx.stream()>>>(T, in, (const float *) x->data, x_tmp.get());
++        }
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    CUDNN_CHECK_RET(cudnnSetStream(cache->handle, ctx.stream()));
++    // Ensure the descriptor is built for this mini-batch.
++    if (ggml_cuda_pyannote_lstm_cudnn_verbose()) {
++        fprintf(stderr, "[cudnn] build+fwd T=%d in=%d H=%d reverse=%d\n", T, in, H, (int) reverse);
++    }
++    CUDNN_CHECK_RET(cudnnBuildRNNDynamic(cache->handle, cache->rnn_desc, 1));
++    cudnnStatus_t st = cudnnRNNForward(
++        cache->handle,
++        cache->rnn_desc,
++        CUDNN_FWD_MODE_INFERENCE,
++        cache->dev_seq_lengths,
++        cache->x_desc,
++        x_tmp.get(),
++        cache->y_desc,
++        y_tmp.get(),
++        cache->hx_desc,
++        hx,
++        hy,
++        cache->cx_desc,
++        cx,
++        cy,
++        cache->weight_space_bytes,
++        cache->weight_space_d,
++        cache->workspace_bytes,
++        cache->workspace_bytes ? work.get() : nullptr,
++        0,
++        nullptr);
++    if (st != CUDNN_STATUS_SUCCESS) {
++        fprintf(stderr,
++                "cuDNN error %d: %s (%s:%d: cudnnRNNForward) T=%d in=%d H=%d ws=%zu weight=%zu hx=%p cx=%p x=%p y=%p\n",
++                (int) st,
++                ggml_cudnn_get_error_string(st),
++                __FILE__,
++                __LINE__,
++                T,
++                in,
++                H,
++                (size_t) cache->workspace_bytes,
++                (size_t) cache->weight_space_bytes,
++                (void *) hx,
++                (void *) cx,
++                (void *) x_tmp.get(),
++                (void *) y_tmp.get());
++        return false;
++    }
++
++    // Convert + transpose output back to ggml layout.
++    {
++        const int n = T * H;
++        const int bs = 256;
++        const int gs = (n + bs - 1) / bs;
++        if (reverse) {
++            // reverse input produces output in reversed time order; flip back.
++            k_f16_cudnn_layout_to_f32_tmajor<true><<<gs, bs, 0, ctx.stream()>>>(T, H, y_tmp.get(), dst, dst_off);
++        } else {
++            k_f16_cudnn_layout_to_f32_tmajor<false><<<gs, bs, 0, ctx.stream()>>>(T, H, y_tmp.get(), dst, dst_off);
++        }
++        CUDA_CHECK(cudaGetLastError());
++    }
++
++    return true;
++}
++
++#undef CUDNN_CHECK_RET
++#endif // GGML_CUDA_USE_CUDNN
++
+ static __device__ __forceinline__ float seg_sigmoidf(float x) {
+     return 1.0f / (1.0f + expf(-x));
+ }
+@@ -267,6 +887,25 @@ static void ggml_cuda_pyannote_seg_lstm_custom(ggml_backend_cuda_context & ctx,
+     const int H = (int) w_hh->ne[0];
+     const int G = 4 * H;
+ 
++#ifdef GGML_CUDA_USE_CUDNN
++    if (ggml_cuda_pyannote_lstm_use_cudnn()) {
++        // Try cuDNN for forward + reverse directions. Fall back to the existing
++        // custom kernel path on any failure.
++        float * out = (float *) dst->data;
++    const bool ok_fwd = pyannote_cudnn_lstm_run_one_dir(ctx, x, w_ih,   w_hh,   b_ih,   b_hh,   T, in, H, false, out, 0);
++    const bool ok_rev = pyannote_cudnn_lstm_run_one_dir(ctx, x, w_ih_r, w_hh_r, b_ih_r, b_hh_r, T, in, H, true,  out, H);
++        if (ok_fwd && ok_rev) {
++            return;
++        }
++
++        if (ggml_cuda_pyannote_lstm_cudnn_force()) {
++            // Hard fail if cuDNN was explicitly forced.
++            fprintf(stderr, "ERROR: cuDNN LSTM forced but failed; aborting to avoid silent fallback\n");
++            GGML_ABORT("cuDNN LSTM forced but failed");
++        }
++    }
++#endif
++
+     cudaStream_t stream = ctx.stream();
+     cublasHandle_t handle = ctx.cublas_handle();
+     CUBLAS_CHECK(cublasSetStream(handle, stream));
