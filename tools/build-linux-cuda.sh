@@ -7,7 +7,9 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/diarization-ggml/build-x86-cuda"
 
 echo "[build-linux-cuda] configure: $BUILD_DIR"
-cmake -S "$ROOT_DIR/diarization-ggml" -B "$BUILD_DIR"
+cmake -S "$ROOT_DIR/diarization-ggml" -B "$BUILD_DIR" \
+  -DGGML_CUDA=ON \
+  -DGGML_CUDA_GRAPHS=OFF
 
 echo "[build-linux-cuda] build -j$JOBS"
 cmake --build "$BUILD_DIR" -j"$JOBS"
