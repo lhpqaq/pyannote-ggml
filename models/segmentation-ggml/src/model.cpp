@@ -113,6 +113,8 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
     const bool dbg_assign_enabled = dbg_assign && std::strcmp(dbg_assign, "1") == 0;
     const char* force_all_gpu_env = std::getenv("DIARIZATION_SEG_FORCE_ALL_GPU");
     const bool force_all_gpu = force_all_gpu_env && std::strcmp(force_all_gpu_env, "1") == 0;
+    const char* full_gpu_env = std::getenv("DIARIZATION_SEG_FULL_GPU");
+    const bool full_gpu = full_gpu_env && std::strcmp(full_gpu_env, "1") == 0;
     const char* force_cpu_im2col_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_IM2COL");
     const bool force_cpu_im2col = force_cpu_im2col_env && std::strcmp(force_cpu_im2col_env, "1") == 0;
     const char* force_cpu_mul_env = std::getenv("DIARIZATION_SEG_FORCE_CPU_MUL");
@@ -216,11 +218,11 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
             continue;
         }
 
-        if (!state.experimental_gpu_partition && !force_all_gpu) {
+        if (!state.experimental_gpu_partition && !force_all_gpu && !full_gpu) {
             continue;
         }
 
-        if (!force_all_gpu) {
+        if (!force_all_gpu && !full_gpu) {
             // Experimental CoreML-like split idea: keep sensitive/custom parts on CPU,
             // offload only selected matmul blocks.
             if (node->op != GGML_OP_MUL_MAT) {
@@ -237,7 +239,7 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
                 break;
             }
         }
-        if (touches_waveform && !force_all_gpu) {
+        if (touches_waveform && !force_all_gpu && !full_gpu) {
             continue;
         }
 
@@ -250,7 +252,7 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
                                   (std::strcmp(node_name, "linear1_mm") == 0 ||
                                    std::strcmp(node_name, "linear2_mm") == 0);
 
-        if (!force_all_gpu && mode_classifier) {
+        if (!force_all_gpu && !full_gpu && mode_classifier) {
             if (!is_classifier_mm) {
                 continue;
             }
@@ -291,11 +293,11 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
                 continue;
             }
 
-        } else if (!force_all_gpu && mode_linear) {
+        } else if (!force_all_gpu && !full_gpu && mode_linear) {
             if (!is_classifier_mm && !is_linear_mm) {
                 continue;
             }
-        } else if (!force_all_gpu && !mode_all) {
+        } else if (!force_all_gpu && !full_gpu && !mode_all) {
             continue;
         }
 
@@ -321,14 +323,14 @@ static int prefer_gpu_for_supported_nodes(segmentation_state& state, struct ggml
 
         // Strict safety for custom-op boundary in partition mode: only offload matmul when both inputs
         // are plain contiguous tensors to avoid layout-dependent mismatch.
-        if (!force_all_gpu && (!node->src[0] || !node->src[1])) {
+        if (!force_all_gpu && !full_gpu && (!node->src[0] || !node->src[1])) {
             if (dbg_assign_enabled) {
                 const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
                 fprintf(stderr, "[seg-assign] skip %s: missing src0/src1\n", node_name_dbg);
             }
             continue;
         }
-        if (!force_all_gpu && (!ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node->src[1]))) {
+        if (!force_all_gpu && !full_gpu && (!ggml_is_contiguous(node->src[0]) || !ggml_is_contiguous(node->src[1]))) {
             if (dbg_assign_enabled) {
                 const char* node_name_dbg = node->name && node->name[0] ? node->name : "(unnamed)";
                 fprintf(stderr,
@@ -1432,8 +1434,7 @@ struct ggml_tensor* model_forward(
         return nullptr;
     }
 
-    // Custom LSTM op outputs CPU-written tensors; force a contiguous staging tensor
-    // before optional GPU head offload to avoid backend handoff ambiguity.
+    // Keep a named contiguous view for debugging. In non-custom mode this is a no-op.
     lstm_out = ggml_cont(ctx, lstm_out);
     ggml_set_name(lstm_out, "lstm_out_cont");
     

@@ -15,7 +15,9 @@
 namespace segmentation {
 
 static bool use_noncustom_lstm_debug_path() {
-    const char* env = std::getenv("DIARIZATION_SEG_LSTM_NOCUSTOM_DEBUG");
+    // Default to the legacy GGML_OP_CUSTOM path (small graph, fast when CUDA supports it).
+    // Set DIARIZATION_SEG_LSTM_NOCUSTOM=1 to use the reference unrolled graph implementation.
+    const char* env = std::getenv("DIARIZATION_SEG_LSTM_NOCUSTOM");
     return env && std::strcmp(env, "1") == 0;
 }
 
@@ -33,10 +35,15 @@ static struct ggml_tensor * lstm_one_direction_noncustom(
 
     const int64_t seq_len = input->ne[0];
 
+    // Prepare X as contiguous [C, T] so we can compute W_ih * X once.
     struct ggml_tensor * x_cont = ggml_cont(ctx, input);
     struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x_cont, input->ne[0], input->ne[1]); // [T, C]
     struct ggml_tensor * x_ct = ggml_transpose(ctx, x_2d);                                  // [C, T]
     x_ct = ggml_cont(ctx, x_ct);
+
+    // Precompute ih_all = W_ih * X for all timesteps: [4H, T]
+    struct ggml_tensor * ih_all = ggml_mul_mat(ctx, w_ih, x_ct);
+    ih_all = ggml_cont(ctx, ih_all);
 
     // Keep all state vectors as [H, 1] to avoid implicit broadcasting edge-cases.
     struct ggml_tensor * bias_h_1d = ggml_view_1d(ctx, b_ih, hidden, 0);
@@ -49,29 +56,27 @@ static struct ggml_tensor * lstm_one_direction_noncustom(
     struct ggml_tensor * h_series = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq_len);
     h_series = ggml_sub(ctx, h_series, h_series);
 
+    // Bias is [4H] in weights; reshape to [4H,1] once so ADD is shape-equal (no broadcast).
+    struct ggml_tensor * bsum_1d = ggml_add(ctx, b_ih, b_hh); // [4H]
+    struct ggml_tensor * bsum = ggml_reshape_2d(ctx, bsum_1d, 4 * hidden, 1);
+    bsum = ggml_cont(ctx, bsum);
+
     for (int64_t step = 0; step < seq_len; ++step) {
         const int64_t t = reverse ? (seq_len - 1 - step) : step;
 
-        struct ggml_tensor * x_t = ggml_view_1d(
+        // ih_t = ih_all[:, t] as [4H, 1]
+        struct ggml_tensor * ih_t = ggml_view_1d(
             ctx,
-            x_ct,
-            input->ne[1],
-            (size_t) t * (size_t) input->ne[1] * sizeof(float));
-        x_t = ggml_cont(ctx, x_t);
-
-        struct ggml_tensor * x_t_col = ggml_reshape_2d(ctx, x_t, input->ne[1], 1);
-        x_t_col = ggml_cont(ctx, x_t_col);
+            ih_all,
+            4 * hidden,
+            (size_t) t * (size_t) (4 * hidden) * sizeof(float));
+        ih_t = ggml_cont(ctx, ih_t);
+        ih_t = ggml_reshape_2d(ctx, ih_t, 4 * hidden, 1);
+        ih_t = ggml_cont(ctx, ih_t);
 
         struct ggml_tensor * h_prev_col = ggml_cont(ctx, h_prev);
-
-        struct ggml_tensor * ih = ggml_mul_mat(ctx, w_ih, x_t_col); // [4H, 1]
         struct ggml_tensor * hh = ggml_mul_mat(ctx, w_hh, h_prev_col); // [4H, 1]
-        struct ggml_tensor * gates = ggml_add(ctx, ih, hh);
-
-        // Bias is [4H] in weights; reshape to [4H,1] so ADD is shape-equal (no broadcast).
-        struct ggml_tensor * bsum_1d = ggml_add(ctx, b_ih, b_hh); // [4H]
-        struct ggml_tensor * bsum = ggml_reshape_2d(ctx, bsum_1d, 4 * hidden, 1);
-        bsum = ggml_cont(ctx, bsum);
+        struct ggml_tensor * gates = ggml_add(ctx, ih_t, hh);
         gates = ggml_add(ctx, gates, bsum);
 
         const size_t ofs_i = 0;
@@ -327,6 +332,7 @@ static void lstm_bidirectional_custom_op(
         run_one(true);
     }
 }
+
 
 static lstm_bidir_params s_bidir_params[4];
 static int s_lstm_param_idx = 0;

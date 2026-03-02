@@ -43,6 +43,10 @@ Use both together for full visibility.
   - Forces segmentation backend stats/split behavior.
   - Primarily for reproducing scheduler split-related issues.
 
+- `DIARIZATION_SEG_FULL_GPU=1`
+  - Assigns all GPU-supported segmentation nodes to GPU (including non-matmul ops).
+  - Intended for full-GPU segmentation experiments.
+
 ## Segmentation Debug Dumps / Metadata
 
 - `DIARIZATION_SEG_DEBUG_DUMP_DIR=/tmp/seg-*`
@@ -65,9 +69,9 @@ Use both together for full visibility.
 - `DIARIZATION_SEG_SINCNET_2D=1`
   - Uses SincNet conv/pool via 2D ops (`conv_2d`/`pool_2d`) instead of 1D path.
 
-- `DIARIZATION_SEG_LSTM_NOCUSTOM_DEBUG=1`
-  - Switches LSTM to non-custom debug graph path (experimental).
-  - Not parity-safe by default; for debugging operator pathways.
+- `DIARIZATION_SEG_LSTM_NOCUSTOM=1`
+  - Switches segmentation LSTM to the non-custom unrolled graph implementation.
+  - This is parity-safe but slower (many nodes / kernel launches).
 
 ## Force Backend for Isolation (Debug Only)
 
@@ -96,13 +100,13 @@ DIARIZATION_DEBUG_BACKEND_ASSIGN_RATIO=1 \
 ./tools/run-diarization.sh samples/sample.wav cuda /tmp/out.rttm
 ```
 
-### 2) Reproduce full-GPU stress for segmentation debug
+### 2) Full-GPU segmentation run
 
 ```bash
 CUDA_LAUNCH_BLOCKING=1 \
-DIARIZATION_SEG_LSTM_NOCUSTOM_DEBUG=1 \
+DIARIZATION_SEG_WEIGHT_BACKEND=cuda \
 DIARIZATION_SEG_SINCNET_2D=1 \
-DIARIZATION_SEG_FORCE_ALL_GPU=1 \
+DIARIZATION_SEG_FULL_GPU=1 \
 ./tools/run-diarization.sh samples/sample.wav cuda /tmp/out_fullgpu.rttm
 ```
 
