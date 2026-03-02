@@ -1,7 +1,40 @@
 #include "sincnet.h"
 #include <iostream>
+#include <cstdlib>
+#include <cstring>
 
 namespace segmentation {
+
+static bool use_sincnet_2d_ops() {
+    const char* env = std::getenv("DIARIZATION_SEG_SINCNET_2D");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+static struct ggml_tensor* conv1d_via_conv2d(
+    struct ggml_context* ctx,
+    struct ggml_tensor* conv_weight,
+    struct ggml_tensor* input,
+    int stride) {
+    // 1D input [T, C, B] -> 2D view [T, 1, C, B]
+    struct ggml_tensor* input_2d = ggml_reshape_4d(ctx, input, input->ne[0], 1, input->ne[1], input->ne[2]);
+    // 1D kernel [K, Cin, Cout] -> 2D kernel [K, 1, Cin, Cout]
+    struct ggml_tensor* weight_2d = ggml_reshape_4d(ctx, conv_weight, conv_weight->ne[0], 1, conv_weight->ne[1], conv_weight->ne[2]);
+    // Match conv1d behavior: no padding, dilation 1.
+    struct ggml_tensor* out_2d = ggml_conv_2d(ctx, weight_2d, input_2d, stride, 1, 0, 0, 1, 1);
+    // Back to [T, C, B]
+    return ggml_reshape_3d(ctx, out_2d, out_2d->ne[0], out_2d->ne[2], out_2d->ne[3]);
+}
+
+static struct ggml_tensor* pool1d_via_pool2d(
+    struct ggml_context* ctx,
+    struct ggml_tensor* x,
+    int pool_size) {
+    // 1D tensor [T, C, B] -> [T, 1, C, B]
+    struct ggml_tensor* x_2d = ggml_reshape_4d(ctx, x, x->ne[0], 1, x->ne[1], x->ne[2]);
+    struct ggml_tensor* pooled_2d = ggml_pool_2d(ctx, x_2d, GGML_OP_POOL_MAX, pool_size, 1, pool_size, 1, 0.0f, 0.0f);
+    // Back to [T, C, B]
+    return ggml_reshape_3d(ctx, pooled_2d, pooled_2d->ne[0], pooled_2d->ne[2], pooled_2d->ne[3]);
+}
 
 // ============================================================================
 // InstanceNorm1d Implementation
@@ -54,7 +87,12 @@ struct ggml_tensor* sincnet_stage(
     bool apply_abs)
 {
     // ggml_conv_1d: kernel shape [kernel_size, channels_in, channels_out], data [time, channels_in, batch]
-    struct ggml_tensor* x = ggml_conv_1d(ctx, conv_weight, input, stride, 0, 1);
+    struct ggml_tensor* x = nullptr;
+    if (use_sincnet_2d_ops()) {
+        x = conv1d_via_conv2d(ctx, conv_weight, input, stride);
+    } else {
+        x = ggml_conv_1d(ctx, conv_weight, input, stride, 0, 1);
+    }
     
     // Add bias: reshape [channels] to [1, channels, 1] for broadcasting with [time, channels, batch]
     if (conv_bias != nullptr) {
@@ -67,7 +105,11 @@ struct ggml_tensor* sincnet_stage(
         x = ggml_abs(ctx, x);
     }
     
-    x = ggml_pool_1d(ctx, x, GGML_OP_POOL_MAX, pool_size, pool_size, 0);
+    if (use_sincnet_2d_ops()) {
+        x = pool1d_via_pool2d(ctx, x, pool_size);
+    } else {
+        x = ggml_pool_1d(ctx, x, GGML_OP_POOL_MAX, pool_size, pool_size, 0);
+    }
     x = ggml_instance_norm_1d(ctx, x, norm_weight, norm_bias, INSTANCE_NORM_EPS);
     x = ggml_leaky_relu(ctx, x, LEAKY_RELU_SLOPE, false);
     

@@ -25,8 +25,11 @@ constexpr int LSTM_LAYERS = 4;
 // Number of linear layers  
 constexpr int LINEAR_LAYERS = 2;
 
-// Maximum graph nodes (custom op LSTM collapses each direction into 1 node, ~50-100 total)
-constexpr int MAX_GRAPH_NODES = 2048;
+// Maximum graph nodes.
+// Kept larger to allow experimental non-custom LSTM graph expansion under debug env flags.
+// The non-custom LSTM path unrolls time steps and can exceed 100k nodes.
+// Keep this large enough to avoid ggml graph build asserts.
+constexpr int MAX_GRAPH_NODES = 262144;
 
 /**
  * @struct segmentation_hparams

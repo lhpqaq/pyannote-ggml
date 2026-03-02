@@ -333,6 +333,8 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     } else
 #endif
     {
+        // Default: keep segmentation weights on CPU for safety.
+        // Full-GPU experiments can override via DIARIZATION_SEG_WEIGHT_BACKEND=cuda.
         std::string seg_weight_backend =
             (config.ggml_backend == "cuda") ? "cpu" : config.ggml_backend;
         if (const char* wb = std::getenv("DIARIZATION_SEG_WEIGHT_BACKEND"); wb && wb[0]) {

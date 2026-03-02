@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 #ifdef __APPLE__
@@ -12,6 +13,179 @@
 #endif
 
 namespace segmentation {
+
+static bool use_noncustom_lstm_debug_path() {
+    const char* env = std::getenv("DIARIZATION_SEG_LSTM_NOCUSTOM_DEBUG");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+// Phase-2 start: layer-0 bidirectional LSTM from standard ggml ops (no GGML_OP_CUSTOM).
+// This is still partial (only first layer), but preserves bidirectional recurrence behavior.
+static struct ggml_tensor * lstm_one_direction_noncustom(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct ggml_tensor * w_ih,
+    struct ggml_tensor * w_hh,
+    struct ggml_tensor * b_ih,
+    struct ggml_tensor * b_hh,
+    int hidden,
+    bool reverse) {
+
+    const int64_t seq_len = input->ne[0];
+
+    struct ggml_tensor * x_cont = ggml_cont(ctx, input);
+    struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x_cont, input->ne[0], input->ne[1]); // [T, C]
+    struct ggml_tensor * x_ct = ggml_transpose(ctx, x_2d);                                  // [C, T]
+    x_ct = ggml_cont(ctx, x_ct);
+
+    // Keep all state vectors as [H, 1] to avoid implicit broadcasting edge-cases.
+    struct ggml_tensor * bias_h_1d = ggml_view_1d(ctx, b_ih, hidden, 0);
+    struct ggml_tensor * bias_h = ggml_reshape_2d(ctx, bias_h_1d, hidden, 1);
+    bias_h = ggml_cont(ctx, bias_h);
+
+    struct ggml_tensor * h_prev = ggml_sub(ctx, bias_h, bias_h);
+    struct ggml_tensor * c_prev = ggml_sub(ctx, bias_h, bias_h);
+
+    struct ggml_tensor * h_series = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, seq_len);
+    h_series = ggml_sub(ctx, h_series, h_series);
+
+    for (int64_t step = 0; step < seq_len; ++step) {
+        const int64_t t = reverse ? (seq_len - 1 - step) : step;
+
+        struct ggml_tensor * x_t = ggml_view_1d(
+            ctx,
+            x_ct,
+            input->ne[1],
+            (size_t) t * (size_t) input->ne[1] * sizeof(float));
+        x_t = ggml_cont(ctx, x_t);
+
+        struct ggml_tensor * x_t_col = ggml_reshape_2d(ctx, x_t, input->ne[1], 1);
+        x_t_col = ggml_cont(ctx, x_t_col);
+
+        struct ggml_tensor * h_prev_col = ggml_cont(ctx, h_prev);
+
+        struct ggml_tensor * ih = ggml_mul_mat(ctx, w_ih, x_t_col); // [4H, 1]
+        struct ggml_tensor * hh = ggml_mul_mat(ctx, w_hh, h_prev_col); // [4H, 1]
+        struct ggml_tensor * gates = ggml_add(ctx, ih, hh);
+
+        // Bias is [4H] in weights; reshape to [4H,1] so ADD is shape-equal (no broadcast).
+        struct ggml_tensor * bsum_1d = ggml_add(ctx, b_ih, b_hh); // [4H]
+        struct ggml_tensor * bsum = ggml_reshape_2d(ctx, bsum_1d, 4 * hidden, 1);
+        bsum = ggml_cont(ctx, bsum);
+        gates = ggml_add(ctx, gates, bsum);
+
+        const size_t ofs_i = 0;
+        const size_t ofs_f = (size_t) hidden * sizeof(float);
+        const size_t ofs_g = (size_t) 2 * hidden * sizeof(float);
+        const size_t ofs_o = (size_t) 3 * hidden * sizeof(float);
+
+        struct ggml_tensor * g_i_1d = ggml_view_1d(ctx, gates, hidden, ofs_i);
+        struct ggml_tensor * g_f_1d = ggml_view_1d(ctx, gates, hidden, ofs_f);
+        struct ggml_tensor * g_g_1d = ggml_view_1d(ctx, gates, hidden, ofs_g);
+        struct ggml_tensor * g_o_1d = ggml_view_1d(ctx, gates, hidden, ofs_o);
+
+        struct ggml_tensor * g_i = ggml_sigmoid(ctx, g_i_1d);
+        struct ggml_tensor * g_f = ggml_sigmoid(ctx, g_f_1d);
+        struct ggml_tensor * g_g = ggml_tanh(ctx, g_g_1d);
+        struct ggml_tensor * g_o = ggml_sigmoid(ctx, g_o_1d);
+
+        g_i = ggml_cont(ctx, ggml_reshape_2d(ctx, g_i, hidden, 1));
+        g_f = ggml_cont(ctx, ggml_reshape_2d(ctx, g_f, hidden, 1));
+        g_g = ggml_cont(ctx, ggml_reshape_2d(ctx, g_g, hidden, 1));
+        g_o = ggml_cont(ctx, ggml_reshape_2d(ctx, g_o, hidden, 1));
+
+        struct ggml_tensor * c_prev_col = ggml_cont(ctx, c_prev);
+        struct ggml_tensor * c_new = ggml_add(ctx, ggml_mul(ctx, g_f, c_prev_col), ggml_mul(ctx, g_i, g_g));
+        struct ggml_tensor * h_new = ggml_mul(ctx, g_o, ggml_tanh(ctx, c_new));
+
+        c_new = ggml_cont(ctx, c_new);
+        h_new = ggml_cont(ctx, h_new);
+
+        struct ggml_tensor * h_new_1d = ggml_reshape_1d(ctx, h_new, hidden);
+        h_new_1d = ggml_cont(ctx, h_new_1d);
+        h_series = ggml_set_1d(ctx, h_series, h_new_1d, (size_t) t * (size_t) hidden * sizeof(float));
+
+        h_prev = h_new;
+        c_prev = c_new;
+    }
+
+    return h_series; // [hidden, T]
+}
+
+static struct ggml_tensor * lstm_layer_bidirectional_noncustom(
+    struct ggml_context * ctx,
+    struct ggml_tensor * input,
+    struct ggml_tensor * w_ih,
+    struct ggml_tensor * w_hh,
+    struct ggml_tensor * b_ih,
+    struct ggml_tensor * b_hh,
+    struct ggml_tensor * w_ih_r,
+    struct ggml_tensor * w_hh_r,
+    struct ggml_tensor * b_ih_r,
+    struct ggml_tensor * b_hh_r,
+    int hidden) {
+
+    const int64_t seq_len = input->ne[0];
+
+    struct ggml_tensor * h_fwd = lstm_one_direction_noncustom(
+        ctx, input, w_ih, w_hh, b_ih, b_hh, hidden, false);
+    struct ggml_tensor * h_rev = lstm_one_direction_noncustom(
+        ctx, input, w_ih_r, w_hh_r, b_ih_r, b_hh_r, hidden, true);
+    if (!h_fwd || !h_rev) {
+        return nullptr;
+    }
+
+    // [hidden, T] + [hidden, T] -> [2*hidden, T] -> [T, 2*hidden, 1]
+    struct ggml_tensor * h_cat = ggml_concat(ctx, h_fwd, h_rev, 0);
+    struct ggml_tensor * h_t = ggml_transpose(ctx, h_cat);
+    h_t = ggml_cont(ctx, h_t);
+    return ggml_reshape_3d(ctx, h_t, seq_len, 2 * hidden, 1);
+}
+
+static struct ggml_tensor* lstm_forward_noncustom_debug(
+    struct ggml_context* ctx,
+    const segmentation_model& model,
+    struct ggml_tensor* input) {
+
+    if (!input) {
+        return nullptr;
+    }
+
+    const int hidden = model.hparams.lstm_hidden;
+
+    struct ggml_tensor * layer_input = input;
+    for (int layer = 0; layer < LSTM_LAYERS; ++layer) {
+        if (!model.lstm_weight_ih[layer] || !model.lstm_weight_hh[layer] ||
+            !model.lstm_bias_ih[layer] || !model.lstm_bias_hh[layer] ||
+            !model.lstm_weight_ih_reverse[layer] || !model.lstm_weight_hh_reverse[layer] ||
+            !model.lstm_bias_ih_reverse[layer] || !model.lstm_bias_hh_reverse[layer]) {
+            fprintf(stderr, "ERROR: noncustom LSTM debug path missing tensors for layer %d\n", layer);
+            return nullptr;
+        }
+
+        layer_input = lstm_layer_bidirectional_noncustom(
+            ctx,
+            layer_input,
+            model.lstm_weight_ih[layer],
+            model.lstm_weight_hh[layer],
+            model.lstm_bias_ih[layer],
+            model.lstm_bias_hh[layer],
+            model.lstm_weight_ih_reverse[layer],
+            model.lstm_weight_hh_reverse[layer],
+            model.lstm_bias_ih_reverse[layer],
+            model.lstm_bias_hh_reverse[layer],
+            hidden);
+        if (!layer_input) {
+            fprintf(stderr, "ERROR: noncustom LSTM debug path failed on layer %d\n", layer);
+            return nullptr;
+        }
+    }
+
+    struct ggml_tensor* bidir_3d = layer_input;
+    ggml_set_name(bidir_3d, "lstm_debug_noncustom_out");
+
+    return bidir_3d;
+}
 
 struct lstm_bidir_params {
     int hidden_size;
@@ -159,6 +333,20 @@ static int s_lstm_param_idx = 0;
 static const lstm_weight_cache* s_active_cache = nullptr;
 
 void lstm_init_weight_cache(lstm_weight_cache& cache, const segmentation_model& model) {
+    // This cache is only used by the legacy GGML_OP_CUSTOM LSTM path (CPU BLAS).
+    // If weights are allocated on GPU, tensor->data is a device pointer and cannot be
+    // read/converted here.
+    if (model.weight_backends.size() > 0) {
+        ggml_backend_t wb = model.weight_backends.front();
+        if (wb) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(wb);
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                cache.initialized = false;
+                return;
+            }
+        }
+    }
+
     int hidden_size = model.hparams.lstm_hidden;
     int gate_size = 4 * hidden_size;
     
@@ -267,6 +455,10 @@ struct ggml_tensor* lstm_forward(
     struct ggml_context* ctx,
     const segmentation_model& model,
     struct ggml_tensor* input) {
+
+    if (use_noncustom_lstm_debug_path()) {
+        return lstm_forward_noncustom_debug(ctx, model, input);
+    }
     
     s_lstm_param_idx = 0;
     
