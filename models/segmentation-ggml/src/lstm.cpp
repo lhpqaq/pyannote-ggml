@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <cstdlib>
 #include <vector>
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
@@ -254,20 +253,12 @@ struct ggml_tensor* lstm_layer_bidirectional(
         weight_ih_rev, weight_hh_rev, bias_ih_rev, bias_hh_rev
     };
     
-    int lstm_tasks = 2;
-    if (const char* env = std::getenv("DIARIZATION_SEG_LSTM_TASKS")) {
-        int parsed = std::atoi(env);
-        if (parsed > 0) {
-            lstm_tasks = parsed;
-        }
-    }
-
     struct ggml_tensor* output = ggml_custom_4d(
         ctx, GGML_TYPE_F32,
         seq_len, 2 * hidden_size, batch, 1,
         args, 9,
         lstm_bidirectional_custom_op,
-        lstm_tasks, params);
+        2, params);
     
     return output;
 }
