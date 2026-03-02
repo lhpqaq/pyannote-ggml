@@ -14,6 +14,12 @@ This file freezes the current working state before cleanup.
   - CUDA fast-path for pyannote segmentation BiLSTM custom op.
   - cuBLAS precompute + CUDA recurrence kernel.
 
+## Downstream Patch
+
+- Because this repo uses `whisper.cpp` as a submodule and downstream users may not have
+  submodule push permissions, the corresponding upstream patch is saved here:
+  - `patches/whisper.cpp/0001-cuda-add-pyannote-seg-LSTM-custom-op-fast-path.patch`
+
 ## Repro Commands (example)
 
 Build:
