@@ -54,3 +54,5 @@ samples/audio_vad_output.wav
 
 # GGML submodule build artifacts
 ggml/build/
+
+whisper.cpp-1/*

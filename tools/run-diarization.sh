@@ -6,7 +6,7 @@ if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
     echo "Usage: $0 <audio.wav> <backend: auto|cpu|metal|cuda> [output.rttm]" >&2
     exit 1
 fi
-
+export DIARIZATION_SEG_LSTM_COOP=1
 AUDIO_PATH="$1"
 BACKEND="$2"
 OUTPUT_PATH="${3:-}"
