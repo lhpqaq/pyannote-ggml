@@ -33,6 +33,63 @@
 #include <string>
 #include <vector>
 
+// This translation unit currently uses zlib only for other components.
+
+static std::string make_npy_header_f4_c_order(const std::vector<long long> & shape) {
+    // NPY v1.0 header, little-endian float32, C-order
+    std::string shape_str = "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        shape_str += std::to_string(shape[i]);
+        if (shape.size() == 1) {
+            shape_str += ",";
+        }
+        if (i + 1 < shape.size()) {
+            shape_str += ", ";
+        }
+    }
+    shape_str += ")";
+
+    std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape_str + ", }";
+
+    std::string header = "\x93NUMPY";
+    header.push_back('\x01');
+    header.push_back('\x00');
+    header.push_back('\x00');
+    header.push_back('\x00');
+
+    std::string hdr = dict;
+    hdr.push_back('\n');
+    while (((header.size() + hdr.size()) % 16) != 0) {
+        hdr.insert(hdr.end() - 1, ' ');
+    }
+
+    const uint16_t hlen = (uint16_t) hdr.size();
+    header[8] = (char) (hlen & 0xff);
+    header[9] = (char) ((hlen >> 8) & 0xff);
+    header += hdr;
+    return header;
+}
+
+static bool dump_seg_logits_npy(const std::string & path,
+                               const float * logits,
+                               int num_chunks,
+                               int frames_per_chunk,
+                               int num_classes) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.good()) {
+        fprintf(stderr, "ERROR: failed to open '%s' for writing\n", path.c_str());
+        return false;
+    }
+
+    const std::vector<long long> shape = { (long long) num_chunks, (long long) frames_per_chunk, (long long) num_classes };
+    const std::string header = make_npy_header_f4_c_order(shape);
+    out.write(header.data(), (std::streamsize) header.size());
+
+    const size_t n_floats = (size_t) num_chunks * (size_t) frames_per_chunk * (size_t) num_classes;
+    out.write(reinterpret_cast<const char *>(logits), (std::streamsize) (n_floats * sizeof(float)));
+    return true;
+}
+
 // ============================================================================
 // Constants — hardcoded pipeline parameters for community-1
 // ============================================================================
@@ -543,6 +600,16 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         // Step 6: Powerset -> multilabel
         // (num_chunks, 589, 7) -> (num_chunks, 589, 3)
         // ================================================================
+
+        if (!config.dump_seg_logits_path.empty()) {
+            std::string out_path = config.dump_seg_logits_path;
+            if (out_path.size() < 4 || out_path.substr(out_path.size() - 4) != ".npy") {
+                out_path += ".npy";
+            }
+            if (dump_seg_logits_npy(out_path, seg_logits.data(), num_chunks, FRAMES_PER_CHUNK, NUM_POWERSET_CLASSES)) {
+                fprintf(stderr, "Saved seg logits: %s\n", out_path.c_str());
+            }
+        }
 
         t_stage_start = Clock::now();
         std::vector<float> binarized(
