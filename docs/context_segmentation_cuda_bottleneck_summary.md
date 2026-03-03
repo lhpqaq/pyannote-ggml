@@ -12,6 +12,12 @@ Key directories:
 - `models/segmentation-ggml/`: segmentation model graph (SincNet + BiLSTM + MLP + classifier).
 - `whisper.cpp/ggml/src/ggml-cuda/`: CUDA backend used by this repo.
 
+CoreML-related components (Apple):
+
+- `models/segmentation-ggml/convert_coreml.py`: PyTorch -> CoreML conversion for segmentation
+- `models/segmentation-ggml/src/coreml/segmentation_coreml_bridge.mm`: runtime bridge
+- diarization flags: `--seg-coreml` (segmentation) and `--coreml` (embedding)
+
 Important note:
 
 - The diarization binary links against the ggml implementation under `whisper.cpp/ggml/`.
@@ -119,6 +125,16 @@ Measured outcome:
 
 - segmentation time reduced from ~4.7s to ~1.0s (representative T4 results)
 
+## 6.3. What "correctness" means in this work
+
+There are multiple notions of correctness relevant to GPU kernel optimization:
+
+- Bitwise identical logits: generally unrealistic once arithmetic order changes due to parallelism.
+- Logits agreement within tolerance: practical and measurable.
+- Downstream diarization equivalence (DER/RTTM): the product metric, but sensitive to thresholding and non-local effects.
+
+In this work, the primary kernel-level validation was logits comparison (max/mean abs diff and argmax agreement), followed by downstream sanity checks.
+
 ### 6.2. Correctness validation approach
 
 Avoid using RTTM/DER alone to validate kernel equivalence because post-processing can amplify small numerical differences.
@@ -141,3 +157,35 @@ Python reference (pyannote-audio) can be used, but note that C++ vs Python are n
   - avoid unnecessary device-host transfers
   - ensure scheduler does not force extra sync points
   - consider limited graph-level capture only if architecture allows
+
+## 8. Minimal command set (copy/paste)
+
+Segmentation-only run:
+
+```bash
+./diarization-ggml/build-x86-cuda/bin/diarization-ggml \
+  models/segmentation-ggml/segmentation.gguf \
+  models/embedding-ggml/embedding.gguf \
+  samples/sample.wav \
+  --backend cuda --bypass-embeddings --plda diarization-ggml/plda.gguf \
+  -o /tmp/out.rttm
+```
+
+Profile with nsys:
+
+```bash
+mkdir -p /tmp/nsys
+nsys profile -o /tmp/nsys/seg_only --force-overwrite=true --trace=cuda,nvtx,osrt \
+  ./diarization-ggml/build-x86-cuda/bin/diarization-ggml \
+    models/segmentation-ggml/segmentation.gguf \
+    models/embedding-ggml/embedding.gguf \
+    samples/sample.wav \
+    --backend cuda --bypass-embeddings --plda diarization-ggml/plda.gguf \
+    -o /tmp/out.rttm
+
+nsys stats --report cuda_gpu_kern_sum,cuda_api_sum /tmp/nsys/seg_only.nsys-rep
+```
+
+## 9. Paper-ready storyline (one paragraph)
+
+We profiled a GPU diarization segmentation pipeline and found that nearly all GPU time is spent in a custom BiLSTM recurrence kernel, while CPU time is dominated by CUDA stream synchronization (waiting for that kernel). Caching graph construction and allocator state did not change runtime, confirming the recurrence kernel as the true bottleneck. We then redesigned the recurrence kernel to parallelize across hidden units within each time step and enforced time-step correctness via a grid-level barrier. This structural change improved GPU occupancy and reduced recurrence kernel latency, resulting in a multi-x end-to-end segmentation speedup on a Tesla T4. Correctness was evaluated primarily using logits-level comparisons (max/mean diff and argmax agreement) rather than downstream RTTM alone.
