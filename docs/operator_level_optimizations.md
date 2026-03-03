@@ -2,6 +2,10 @@
 
 This document collects operator-level implementation details and optimization ideas for the segmentation model.
 
+For an end-to-end (seg + emb + CoreML + CUDA) full-flow document, see:
+
+- `docs/operator_level_optimizations_fullflow.md`
+
 Scope:
 
 - LSTM recurrence custom CUDA operator (primary bottleneck)
