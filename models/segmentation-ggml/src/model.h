@@ -224,6 +224,13 @@ bool state_init(segmentation_state& state,
                 int gpu_device,
                 bool verbose);
 
+// Prepare scheduler buffers for a specific batch size by allocating a batch graph once.
+// This is required because some backends/schedulers assume a fixed maximum graph shape.
+bool state_prepare_batch(segmentation_state& state,
+                         segmentation_model& model,
+                         int batch,
+                         bool verbose);
+
 /**
  * @brief Free state resources
  * @param state State to free
@@ -281,6 +288,49 @@ bool model_infer(
     size_t n_samples,
     float* output,
     size_t output_size);
+
+// Batched inference: audio is [batch, n_samples] contiguous.
+// Output is [batch, frames(589), classes(7)] in GGML output memory layout
+// (i.e. per batch element, class-major with contiguous frames).
+// Batched inference: audio is [batch, n_samples] contiguous.
+// Output is frame-major [batch, 589, 7] (same layout as diarization expects).
+bool model_infer_batch(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples_per_chunk,
+    int batch,
+    float* output,
+    size_t output_size);
+
+struct infer_tensor_info {
+    int64_t ne0 = 0;
+    int64_t ne1 = 0;
+    int64_t ne2 = 0;
+    int64_t ne3 = 0;
+    ggml_type type = GGML_TYPE_F32;
+};
+
+// Debug/validation helpers: fetch a named tensor from the graph output.
+// NOTE: output is raw tensor bytes reinterpreted as float32 (only supports F32 tensors).
+bool model_infer_tensor(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples,
+    const char* tensor_name,
+    std::vector<float>& out,
+    infer_tensor_info& info);
+
+bool model_infer_batch_tensor(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples_per_chunk,
+    int batch,
+    const char* tensor_name,
+    std::vector<float>& out,
+    infer_tensor_info& info);
 
 void state_set_backend_stats(segmentation_state& state, bool enable);
 

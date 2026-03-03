@@ -8,6 +8,8 @@
 #include <chrono>
 #include <fstream>
 #include <cstring>
+#include <cstdlib>
+#include <cstdint>
 #include <ggml-cpu.h>
 #include <ggml-backend.h>
 
@@ -85,6 +87,87 @@ static bool load_wav_file(const std::string& path, std::vector<float>& samples, 
     
     file.close();
     return true;
+}
+
+static std::string make_npy_header_f4_c_order(const std::vector<long long> & shape) {
+    // NPY v1.0 header, little-endian float32, C-order
+    std::string shape_str = "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        shape_str += std::to_string(shape[i]);
+        if (shape.size() == 1) {
+            shape_str += ",";
+        }
+        if (i + 1 < shape.size()) {
+            shape_str += ", ";
+        }
+    }
+    shape_str += ")";
+
+    std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': " + shape_str + ", }";
+
+    std::string header = "\x93NUMPY";
+    header.push_back('\x01');
+    header.push_back('\x00');
+    header.push_back('\x00');
+    header.push_back('\x00');
+
+    std::string hdr = dict;
+    hdr.push_back('\n');
+    while (((header.size() + hdr.size()) % 16) != 0) {
+        hdr.insert(hdr.end() - 1, ' ');
+    }
+
+    const uint16_t hlen = (uint16_t) hdr.size();
+    header[8] = (char) (hlen & 0xff);
+    header[9] = (char) ((hlen >> 8) & 0xff);
+    header += hdr;
+    return header;
+}
+
+static bool save_logits_npy(const std::string & path, const float * data, int64_t ne0, int64_t ne1, int64_t ne2) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out.good()) {
+        fprintf(stderr, "ERROR: failed to open '%s'\n", path.c_str());
+        return false;
+    }
+    const std::vector<long long> shape = { (long long) ne2, (long long) ne0, (long long) ne1 };
+    const std::string header = make_npy_header_f4_c_order(shape);
+    out.write(header.data(), (std::streamsize) header.size());
+    const size_t n = (size_t) ne0 * (size_t) ne1 * (size_t) ne2;
+    out.write(reinterpret_cast<const char *>(data), (std::streamsize) (n * sizeof(float)));
+    return true;
+}
+
+static void print_logsumexp_check_raw(const float * raw, int batch, int seq_len, int classes) {
+    // raw layout is class-major per batch element: [batch][classes][seq]
+    double min_lse = 1e300;
+    double max_lse = -1e300;
+    double mean_lse = 0.0;
+    size_t count = 0;
+    for (int b = 0; b < batch; ++b) {
+        const float * base = raw + (size_t) b * (size_t) classes * (size_t) seq_len;
+        for (int t = 0; t < seq_len; ++t) {
+            float m = base[t];
+            for (int k = 1; k < classes; ++k) {
+                const float v = base[(size_t) k * (size_t) seq_len + (size_t) t];
+                if (v > m) m = v;
+            }
+            double s = 0.0;
+            for (int k = 0; k < classes; ++k) {
+                const float v = base[(size_t) k * (size_t) seq_len + (size_t) t];
+                s += std::exp((double) v - (double) m);
+            }
+            const double lse = (double) m + std::log(s);
+            min_lse = std::min(min_lse, lse);
+            max_lse = std::max(max_lse, lse);
+            mean_lse += lse;
+            count++;
+        }
+    }
+    if (count) {
+        mean_lse /= (double) count;
+    }
+    printf("logsumexp(log_probs) range: [%.3g, %.3g], mean %.3g (expected ~0)\n", min_lse, max_lse, mean_lse);
 }
 
 static bool test_sincnet_shapes(const segmentation::segmentation_model& model) {
@@ -639,7 +722,7 @@ int main(int argc, char** argv) {
     std::cout << "================================================" << std::endl;
 
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <model.gguf> [--test] [--benchmark] [--audio <path>] [--save-output <path>]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <model.gguf> [--test] [--benchmark] [--audio <path>] [--save-output <path>] [--backend auto|cpu|cuda] [--gpu-device N] [--batch N] [--batch-compare] [--tensor <name>] [--dump-logits-npy <path>]" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Arguments:" << std::endl;
         std::cerr << "  model.gguf                - Path to the GGUF model file" << std::endl;
@@ -647,6 +730,12 @@ int main(int argc, char** argv) {
         std::cerr << "  --benchmark               - Run performance benchmark" << std::endl;
         std::cerr << "  --audio <path>            - Load audio from WAV file (16kHz mono PCM)" << std::endl;
         std::cerr << "  --save-output <path>      - Save test output to binary file" << std::endl;
+        std::cerr << "  --backend <name>          - Backend: auto|cpu|cuda" << std::endl;
+        std::cerr << "  --gpu-device <n>          - CUDA device id" << std::endl;
+        std::cerr << "  --batch <n>               - Batch size (for model_infer_batch)" << std::endl;
+        std::cerr << "  --batch-compare           - Compare batch output with per-sample model_infer" << std::endl;
+        std::cerr << "  --tensor <name>           - Named tensor to fetch (default classifier_out)" << std::endl;
+        std::cerr << "  --dump-logits-npy <path>  - Dump raw logits to .npy" << std::endl;
         return 1;
     }
 
@@ -657,6 +746,12 @@ int main(int argc, char** argv) {
     bool run_benchmark = false;
     std::string audio_path;
     std::string output_path;
+    std::string backend = "auto";
+    int gpu_device = 0;
+    int batch = 1;
+    bool batch_compare = false;
+    std::string dump_logits_npy;
+    std::string tensor_name = "classifier_out";
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--test") {
@@ -667,17 +762,36 @@ int main(int argc, char** argv) {
             audio_path = argv[++i];
         } else if (arg == "--save-output" && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (arg == "--backend" && i + 1 < argc) {
+            backend = argv[++i];
+        } else if (arg == "--gpu-device" && i + 1 < argc) {
+            gpu_device = std::atoi(argv[++i]);
+        } else if (arg == "--batch" && i + 1 < argc) {
+            batch = std::atoi(argv[++i]);
+        } else if (arg == "--batch-compare") {
+            batch_compare = true;
+        } else if (arg == "--tensor" && i + 1 < argc) {
+            tensor_name = argv[++i];
+        } else if (arg == "--dump-logits-npy" && i + 1 < argc) {
+            dump_logits_npy = argv[++i];
         }
     }
 
     try {
         segmentation::segmentation_model model;
         segmentation::segmentation_state state;
-        
+
         std::cout << "\nLoading model..." << std::endl;
-        if (!segmentation::model_load(model_path, model)) {
-            std::cerr << "Error: Failed to load model from " << model_path << std::endl;
-            return 1;
+        if (backend == "cuda") {
+            if (!segmentation::model_load(model_path, model, backend, gpu_device, true)) {
+                std::cerr << "Error: Failed to load model from " << model_path << std::endl;
+                return 1;
+            }
+        } else {
+            if (!segmentation::model_load(model_path, model)) {
+                std::cerr << "Error: Failed to load model from " << model_path << std::endl;
+                return 1;
+            }
         }
 
         std::cout << "\n" << std::string(60, '=') << std::endl;
@@ -688,10 +802,20 @@ int main(int argc, char** argv) {
         segmentation::model_verify(model);
         
         // Initialize inference state (backends + scheduler)
-        if (!segmentation::state_init(state, model)) {
+        if (!segmentation::state_init(state, model, backend, gpu_device, true)) {
             std::cerr << "Error: Failed to initialize inference state" << std::endl;
             segmentation::model_free(model);
             return 1;
+        }
+
+        // For batch > 1 we must pre-allocate for the batch graph.
+        if (batch > 1) {
+            if (!segmentation::state_prepare_batch(state, model, batch, true)) {
+                std::cerr << "Error: Failed to prepare batch scheduler" << std::endl;
+                segmentation::state_free(state);
+                segmentation::model_free(model);
+                return 1;
+            }
         }
 
         if (run_test) {
@@ -734,7 +858,101 @@ int main(int argc, char** argv) {
 
         if (!audio_path.empty()) {
             std::cout << "\nAudio path: " << audio_path << std::endl;
-            std::cout << "Audio inference not yet implemented" << std::endl;
+
+            if (batch >= 1) {
+                if (backend == "cpu" || backend == "auto") {
+                    std::cerr << "ERROR: --audio requires CUDA backend for this tool" << std::endl;
+                    segmentation::state_free(state);
+                    segmentation::model_free(model);
+                    return 1;
+                }
+                std::vector<float> audio_samples;
+                uint32_t sr = 0;
+                if (!load_wav_file(audio_path, audio_samples, sr) || sr != 16000) {
+                    std::cerr << "Error: failed to load audio or wrong sample rate" << std::endl;
+                    segmentation::state_free(state);
+                    segmentation::model_free(model);
+                    return 1;
+                }
+                if (audio_samples.size() < 160000) {
+                    audio_samples.resize(160000, 0.0f);
+                }
+                if (audio_samples.size() > 160000) {
+                    audio_samples.resize(160000);
+                }
+
+                std::vector<float> batch_audio((size_t) batch * 160000);
+                for (int b = 0; b < batch; ++b) {
+                    std::memcpy(batch_audio.data() + (size_t) b * 160000,
+                                audio_samples.data(),
+                                (size_t) 160000 * sizeof(float));
+                }
+
+                segmentation::infer_tensor_info info;
+                std::vector<float> out_raw;
+                bool ok = false;
+                if (batch == 1) {
+                    ok = segmentation::model_infer_tensor(model, state,
+                                                          batch_audio.data(), 160000,
+                                                          tensor_name.c_str(), out_raw, info);
+                } else {
+                    ok = segmentation::model_infer_batch_tensor(model, state,
+                                                                batch_audio.data(), 160000, batch,
+                                                                tensor_name.c_str(), out_raw, info);
+                }
+                if (!ok) {
+                    std::cerr << "Batch inference failed" << std::endl;
+                    segmentation::state_free(state);
+                    segmentation::model_free(model);
+                    return 1;
+                }
+
+                const int seq_len = (int) info.ne0;
+                const int classes = (int) info.ne1;
+                const int b_out   = (int) info.ne2;
+                if (tensor_name == "classifier_out") {
+                    print_logsumexp_check_raw(out_raw.data(), b_out, seq_len, classes);
+                }
+
+                if (!dump_logits_npy.empty()) {
+                    std::string p = dump_logits_npy;
+                    if (p.size() < 4 || p.substr(p.size() - 4) != ".npy") {
+                        p += ".npy";
+                    }
+                    // Save as [batch, classes, seq_len] raw layout
+                    save_logits_npy(p, out_raw.data(), seq_len, classes, b_out);
+                    std::cout << "Saved logits: " << p << std::endl;
+                }
+
+                if (batch_compare) {
+                    float max_abs = 0.0f;
+                    size_t worst = 0;
+                    for (int b = 0; b < batch; ++b) {
+                        segmentation::infer_tensor_info info1;
+                        std::vector<float> one_raw;
+                        bool ok1 = segmentation::model_infer_tensor(model, state,
+                                                                     batch_audio.data() + (size_t) b * 160000, 160000,
+                                                                     tensor_name.c_str(), one_raw, info1);
+                        if (!ok1) {
+                            std::cerr << "model_infer failed for sample " << b << std::endl;
+                            break;
+                        }
+                        if ((int) info1.ne0 != seq_len || (int) info1.ne1 != classes) {
+                            std::cerr << "shape mismatch in per-sample tensor" << std::endl;
+                            break;
+                        }
+                        const float * br = out_raw.data() + (size_t) b * (size_t) seq_len * (size_t) classes;
+                        for (size_t i = 0; i < one_raw.size(); ++i) {
+                            float d = std::fabs(one_raw[i] - br[i]);
+                            if (d > max_abs) {
+                                max_abs = d;
+                                worst = i;
+                            }
+                        }
+                    }
+                    std::cout << "Batch compare: max_abs_diff=" << max_abs << " worst_index=" << worst << std::endl;
+                }
+            }
         }
 
         std::cout << "\nDone!" << std::endl;

@@ -522,57 +522,96 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
         static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
 
     {
-        std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
-        for (int c = 0; c < num_chunks; c++) {
-            const int chunk_start = c * STEP_SAMPLES;
-            int copy_len = n_samples - chunk_start;
-            if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
-            if (copy_len < 0) copy_len = 0;
+        const char * env_bs = std::getenv("DIARIZATION_SEG_BATCH");
+        int batch_size = 1;
+        if (env_bs && env_bs[0] != '\0') {
+            batch_size = std::atoi(env_bs);
+        }
+        // Current segmentation model graph is built for batch=1.
+        // Keep batching disabled by default until full batched graph correctness is implemented.
+        if (batch_size != 1) {
+            fprintf(stderr, "WARNING: DIARIZATION_SEG_BATCH != 1 not supported yet; falling back to 1\n");
+            batch_size = 1;
+        }
+        if (batch_size <= 0) {
+            batch_size = 1;
+        }
 
-            std::fill(cropped.begin(), cropped.end(), 0.0f);
-            if (copy_len > 0) {
-                std::memcpy(cropped.data(), audio + chunk_start,
-                            static_cast<size_t>(copy_len) * sizeof(float));
+        std::vector<float> batch_audio((size_t) batch_size * CHUNK_SAMPLES, 0.0f);
+        std::vector<float> batch_out((size_t) batch_size * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES, 0.0f);
+        std::vector<float> tmp(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+
+        for (int c0 = 0; c0 < num_chunks; c0 += batch_size) {
+            const int b = std::min(batch_size, num_chunks - c0);
+
+            std::fill(batch_audio.begin(), batch_audio.end(), 0.0f);
+            for (int bi = 0; bi < b; ++bi) {
+                const int c = c0 + bi;
+                const int chunk_start = c * STEP_SAMPLES;
+                int copy_len = n_samples - chunk_start;
+                if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
+                if (copy_len < 0) copy_len = 0;
+
+                if (copy_len > 0) {
+                    std::memcpy(batch_audio.data() + (size_t) bi * CHUNK_SAMPLES,
+                                audio + chunk_start,
+                                static_cast<size_t>(copy_len) * sizeof(float));
+                }
             }
-
-            float* output = seg_logits.data() +
-                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
 
 #ifdef SEGMENTATION_USE_COREML
             if (use_seg_coreml) {
-                segmentation_coreml_infer(seg_coreml_ctx,
-                                          cropped.data(), CHUNK_SAMPLES,
-                                          output,
-                                          FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
-                // CoreML output is already frame-major [589][7] — no transpose needed
+                // CoreML bridge currently supports single-chunk inference only.
+                for (int bi = 0; bi < b; ++bi) {
+                    float * out_one = batch_out.data() + (size_t) bi * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+                    segmentation_coreml_infer(seg_coreml_ctx,
+                                              batch_audio.data() + (size_t) bi * CHUNK_SAMPLES,
+                                              CHUNK_SAMPLES,
+                                              out_one,
+                                              FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+                }
             } else
 #endif
             {
-                if (!segmentation::model_infer(seg_model, seg_state,
-                                               cropped.data(), CHUNK_SAMPLES,
-                                               output,
-                                               FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES)) {
-                    fprintf(stderr, "Error: segmentation failed at chunk %d/%d\n",
-                            c + 1, num_chunks);
-                    goto cleanup;
-                }
-
-                // Transpose GGML output from [class, frame] to [frame, class] layout
-                // GGML stores [589, 7, 1] with ne[0]=589 contiguous, so memory is [7][589]
-                // powerset_to_multilabel expects [589][7] (frame-major)
-                {
-                    std::vector<float> tmp(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
-                    std::memcpy(tmp.data(), output, tmp.size() * sizeof(float));
-                    for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
-                        for (int k = 0; k < NUM_POWERSET_CLASSES; k++) {
-                            output[f * NUM_POWERSET_CLASSES + k] = tmp[k * FRAMES_PER_CHUNK + f];
-                        }
+                if (b == 1) {
+                    // Use the original single-chunk path for parity.
+                    float * out_one = batch_out.data();
+                    if (!segmentation::model_infer(seg_model, seg_state,
+                                                   batch_audio.data(), CHUNK_SAMPLES,
+                                                   out_one,
+                                                   FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES)) {
+                        fprintf(stderr, "Error: segmentation failed at chunk %d/%d\n",
+                                c0 + 1, num_chunks);
+                        goto cleanup;
+                    }
+                } else {
+                    const size_t out_elems = (size_t) b * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+                    if (!segmentation::model_infer_batch(seg_model, seg_state,
+                                                         batch_audio.data(), CHUNK_SAMPLES, b,
+                                                         batch_out.data(), out_elems)) {
+                        fprintf(stderr, "Error: segmentation batch failed at chunk %d/%d\n",
+                                c0 + 1, num_chunks);
+                        goto cleanup;
                     }
                 }
             }
 
-            if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {
-                fprintf(stderr, "%d/%d chunks\r", c + 1, num_chunks);
+            for (int bi = 0; bi < b; ++bi) {
+                float * output = seg_logits.data() +
+                    static_cast<size_t>(c0 + bi) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+                const float * src = batch_out.data() + (size_t) bi * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+
+                // Transpose GGML output from [class, frame] to [frame, class] layout
+                std::memcpy(tmp.data(), src, tmp.size() * sizeof(float));
+                for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
+                    for (int k = 0; k < NUM_POWERSET_CLASSES; k++) {
+                        output[f * NUM_POWERSET_CLASSES + k] = tmp[k * FRAMES_PER_CHUNK + f];
+                    }
+                }
+            }
+
+            if ((c0 + b) % 50 == 0 || c0 + b == num_chunks) {
+                fprintf(stderr, "%d/%d chunks\r", c0 + b, num_chunks);
                 fflush(stderr);
             }
         }

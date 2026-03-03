@@ -164,6 +164,10 @@ static lstm_bidir_params s_bidir_params[4];
 static int s_lstm_param_idx = 0;
 static const lstm_weight_cache* s_active_cache = nullptr;
 
+static void lstm_reset_layer_index() {
+    s_lstm_param_idx = 0;
+}
+
 void lstm_init_weight_cache(lstm_weight_cache& cache, const segmentation_model& model) {
     // This cache is only used by the legacy GGML_OP_CUSTOM LSTM path (CPU BLAS).
     // If weights are allocated on GPU, tensor->data is a device pointer and cannot be
@@ -281,8 +285,9 @@ struct ggml_tensor* lstm_forward(
     struct ggml_context* ctx,
     const segmentation_model& model,
     struct ggml_tensor* input) {
-    
-    s_lstm_param_idx = 0;
+
+    // Ensure stable mapping of layer index -> weight cache for each graph build.
+    lstm_reset_layer_index();
     
     if (!input) {
         fprintf(stderr, "ERROR: LSTM input is null\n");

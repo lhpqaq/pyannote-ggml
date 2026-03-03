@@ -798,27 +798,33 @@ static struct ggml_tensor* linear_forward(
     struct ggml_tensor* weight,
     struct ggml_tensor* bias,
     const char* mm_name) {
-    
-    int64_t seq_len = x->ne[0];
-    int64_t input_dim = x->ne[1];
-    int64_t output_dim = weight->ne[1];
-    
+
+    const int64_t seq_len = x->ne[0];
+    const int64_t input_dim = x->ne[1];
+    const int64_t batch = x->ne[2];
+    const int64_t output_dim = weight->ne[1];
+
+    // x:   [seq_len, input_dim, batch]
+    // x_t: [input_dim, seq_len, batch]
     struct ggml_tensor* x_t = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_t = ggml_cont(ctx, x_t);
-    struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
+
+    // Fold (seq_len, batch) into columns: [input_dim, seq_len * batch]
+    struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len * batch);
     x_2d = ggml_cont(ctx, x_2d);
-    
+
+    // y_2d: [output_dim, seq_len * batch]
     struct ggml_tensor* y_2d = ggml_mul_mat(ctx, weight, x_2d);
     if (mm_name) {
         ggml_set_name(y_2d, mm_name);
     }
     y_2d = ggml_add(ctx, y_2d, bias);
     y_2d = ggml_leaky_relu(ctx, y_2d, 0.01f, true);
-    
-    struct ggml_tensor* y_2d_t = ggml_transpose(ctx, y_2d);
-    y_2d_t = ggml_cont(ctx, y_2d_t);
-    
-    struct ggml_tensor* y = ggml_reshape_3d(ctx, y_2d_t, seq_len, output_dim, 1);
+
+    // Un-flatten: [output_dim, seq_len, batch] -> [seq_len, output_dim, batch]
+    struct ggml_tensor* y_3d = ggml_reshape_3d(ctx, y_2d, output_dim, seq_len, batch);
+    struct ggml_tensor* y = ggml_permute(ctx, y_3d, 1, 0, 2, 3);
+    y = ggml_cont(ctx, y);
     return y;
 }
 
@@ -827,28 +833,33 @@ static struct ggml_tensor* classifier_forward(
     struct ggml_tensor* x,
     struct ggml_tensor* weight,
     struct ggml_tensor* bias) {
-    
-    int64_t seq_len = x->ne[0];
-    int64_t input_dim = x->ne[1];
-    int64_t num_classes = weight->ne[1];
 
+    const int64_t seq_len = x->ne[0];
+    const int64_t input_dim = x->ne[1];
+    const int64_t batch = x->ne[2];
+    const int64_t num_classes = weight->ne[1];
+
+    // x_t: [input_dim, seq_len, batch]
     struct ggml_tensor* x_t = ggml_permute(ctx, x, 1, 0, 2, 3);
     x_t = ggml_cont(ctx, x_t);
 
-    struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len);
+    // Fold (seq_len, batch) into columns: [input_dim, seq_len * batch]
+    struct ggml_tensor* x_2d = ggml_reshape_2d(ctx, x_t, input_dim, seq_len * batch);
     x_2d = ggml_cont(ctx, x_2d);
 
+    // logits_2d: [num_classes, seq_len * batch]
     struct ggml_tensor* logits_2d = ggml_mul_mat(ctx, weight, x_2d);
     ggml_set_name(logits_2d, "classifier_mm");
     logits_2d = ggml_add(ctx, logits_2d, bias);
-    
+
+    // softmax over classes per column
     struct ggml_tensor* probs = ggml_soft_max(ctx, logits_2d);
     struct ggml_tensor* log_probs = ggml_log(ctx, probs);
-    
-    struct ggml_tensor* output_2d = ggml_transpose(ctx, log_probs);
-    output_2d = ggml_cont(ctx, output_2d);
-    
-    struct ggml_tensor* output = ggml_reshape_3d(ctx, output_2d, seq_len, num_classes, 1);
+
+    // Un-flatten: [num_classes, seq_len, batch] -> [seq_len, num_classes, batch]
+    struct ggml_tensor* out_3d = ggml_reshape_3d(ctx, log_probs, num_classes, seq_len, batch);
+    struct ggml_tensor* output = ggml_permute(ctx, out_3d, 1, 0, 2, 3);
+    output = ggml_cont(ctx, output);
     return output;
 }
 
@@ -866,6 +877,10 @@ struct ggml_tensor* model_forward(
         fprintf(stderr, "ERROR: SincNet forward pass failed\n");
         return nullptr;
     }
+
+    // Keep a named contiguous view for debugging.
+    features = ggml_cont(ctx, features);
+    ggml_set_name(features, "sincnet_out_cont");
     
     struct ggml_tensor* lstm_out = lstm_forward(ctx, model, features);
     if (!lstm_out) {
@@ -933,6 +948,77 @@ struct ggml_cgraph* build_graph(
     ggml_free(ctx);
     
     return graph;
+}
+
+static struct ggml_cgraph* build_graph_batch(
+    segmentation_model& model,
+    segmentation_state& state,
+    int batch) {
+
+    if (batch <= 0) {
+        return nullptr;
+    }
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ state.graph_meta.size(),
+        /*.mem_buffer =*/ state.graph_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context* ctx = ggml_init(params);
+    if (!ctx) {
+        fprintf(stderr, "ERROR: Failed to create graph context\n");
+        return nullptr;
+    }
+
+    struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, MAX_GRAPH_NODES, false);
+
+    struct ggml_tensor* input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 160000, 1, batch);
+    ggml_set_name(input, "waveform");
+    ggml_set_input(input);
+
+    struct ggml_tensor* output = model_forward(ctx, model, input);
+    if (!output) {
+        ggml_free(ctx);
+        return nullptr;
+    }
+
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+    ggml_free(ctx);
+    return graph;
+}
+
+bool state_prepare_batch(segmentation_state& state,
+                         segmentation_model& model,
+                         int batch,
+                         bool verbose) {
+    if (batch <= 1) {
+        return true;
+    }
+    if (!state.sched) {
+        fprintf(stderr, "ERROR: state_prepare_batch requires initialized scheduler\n");
+        return false;
+    }
+    if (verbose) {
+        printf("  Preparing scheduler buffers for batch=%d...\n", batch);
+    }
+
+    struct ggml_cgraph* graph = build_graph_batch(model, state, batch);
+    if (!graph) {
+        fprintf(stderr, "ERROR: Failed to build batch graph for pre-allocation\n");
+        return false;
+    }
+
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
+    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
+        fprintf(stderr, "ERROR: Failed to allocate compute buffers for batch graph\n");
+        return false;
+    }
+    ggml_backend_sched_reset(state.sched);
+    return true;
 }
 
 // ============================================================================
@@ -1017,6 +1103,226 @@ bool model_infer(
     auto prof_end = std::chrono::high_resolution_clock::now();
     
     return true;
+}
+
+bool model_infer_batch(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples_per_chunk,
+    int batch,
+    float* output,
+    size_t output_size) {
+
+    if (batch <= 0) {
+        return false;
+    }
+    if (n_samples_per_chunk != 160000) {
+        fprintf(stderr, "ERROR: model_infer_batch expects 160000 samples per chunk\n");
+        return false;
+    }
+
+    struct ggml_cgraph* graph = build_graph_batch(model, state, batch);
+    if (!graph) {
+        fprintf(stderr, "ERROR: Failed to build computation graph (batch=%d)\n", batch);
+        return false;
+    }
+
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
+    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
+        fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
+        return false;
+    }
+
+    struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "waveform");
+    if (!input_tensor) {
+        fprintf(stderr, "ERROR: Input tensor 'waveform' not found in graph\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+
+    // ggml tensor memory for [ne0, ne1, ne2] is laid out with ne0 contiguous,
+    // then ne1, then ne2 (i.e. waveform for each batch element is contiguous).
+    // Our input buffer is also [batch][samples] contiguous, so we can copy once.
+    const size_t input_bytes = (size_t) batch * n_samples_per_chunk * sizeof(float);
+    ggml_backend_tensor_set(input_tensor, audio, 0, input_bytes);
+
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_INPUT) && node != input_tensor) {
+            size_t nbytes = ggml_nbytes(node);
+            std::vector<uint8_t> zeros(nbytes, 0);
+            ggml_backend_tensor_set(node, zeros.data(), 0, nbytes);
+        }
+    }
+
+    lstm_reset_profile();
+    lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
+
+    if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ERROR: Graph computation failed\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+
+    struct ggml_tensor* output_tensor = ggml_graph_get_tensor(graph, "classifier_out");
+    if (!output_tensor) {
+        fprintf(stderr, "ERROR: Output tensor 'classifier_out' not found in graph\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+
+    // Return raw ggml output layout to match model_infer.
+    // Caller will transpose from [class, frame] to [frame, class].
+    const size_t out_bytes = ggml_nbytes(output_tensor);
+    const size_t requested_bytes = output_size * sizeof(float);
+    const size_t copy_bytes = (out_bytes < requested_bytes) ? out_bytes : requested_bytes;
+    ggml_backend_tensor_get(output_tensor, output, 0, copy_bytes);
+
+    ggml_backend_sched_reset(state.sched);
+    return true;
+}
+
+static bool fetch_named_tensor_f32(struct ggml_cgraph* graph, const char* tensor_name, std::vector<float>& out, infer_tensor_info& info) {
+    if (!graph || !tensor_name) {
+        return false;
+    }
+    struct ggml_tensor* t = ggml_graph_get_tensor(graph, tensor_name);
+    if (!t) {
+        fprintf(stderr, "ERROR: tensor '%s' not found in graph\n", tensor_name);
+        return false;
+    }
+    if (t->type != GGML_TYPE_F32) {
+        fprintf(stderr, "ERROR: tensor '%s' is not F32 (%s)\n", tensor_name, ggml_type_name(t->type));
+        return false;
+    }
+    info.ne0 = t->ne[0];
+    info.ne1 = t->ne[1];
+    info.ne2 = t->ne[2];
+    info.ne3 = t->ne[3];
+    info.type = t->type;
+    const size_t nbytes = ggml_nbytes(t);
+    out.resize(nbytes / sizeof(float));
+    ggml_backend_tensor_get(t, out.data(), 0, nbytes);
+    return true;
+}
+
+bool model_infer_tensor(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples,
+    const char* tensor_name,
+    std::vector<float>& out,
+    infer_tensor_info& info) {
+
+    struct ggml_cgraph* graph = build_graph(model, state);
+    if (!graph) {
+        return false;
+    }
+
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
+    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
+        fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
+        return false;
+    }
+
+    struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "waveform");
+    if (!input_tensor) {
+        fprintf(stderr, "ERROR: Input tensor 'waveform' not found in graph\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+    ggml_backend_tensor_set(input_tensor, audio, 0, n_samples * sizeof(float));
+
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_INPUT) && node != input_tensor) {
+            size_t nbytes = ggml_nbytes(node);
+            std::vector<uint8_t> zeros(nbytes, 0);
+            ggml_backend_tensor_set(node, zeros.data(), 0, nbytes);
+        }
+    }
+
+    lstm_reset_profile();
+    lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
+
+    if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ERROR: Graph computation failed\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+
+    const bool ok = fetch_named_tensor_f32(graph, tensor_name, out, info);
+    ggml_backend_sched_reset(state.sched);
+    return ok;
+}
+
+bool model_infer_batch_tensor(
+    segmentation_model& model,
+    segmentation_state& state,
+    const float* audio,
+    size_t n_samples_per_chunk,
+    int batch,
+    const char* tensor_name,
+    std::vector<float>& out,
+    infer_tensor_info& info) {
+
+    if (batch <= 0) {
+        return false;
+    }
+    if (n_samples_per_chunk != 160000) {
+        fprintf(stderr, "ERROR: model_infer_batch_tensor expects 160000 samples per chunk\n");
+        return false;
+    }
+
+    struct ggml_cgraph* graph = build_graph_batch(model, state, batch);
+    if (!graph) {
+        return false;
+    }
+
+    prefer_gpu_for_supported_nodes(state, graph);
+    report_gpu_offload_coverage_once(state, graph);
+
+    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
+        fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
+        return false;
+    }
+
+    struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "waveform");
+    if (!input_tensor) {
+        fprintf(stderr, "ERROR: Input tensor 'waveform' not found in graph\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+    const size_t input_bytes = (size_t) batch * n_samples_per_chunk * sizeof(float);
+    ggml_backend_tensor_set(input_tensor, audio, 0, input_bytes);
+
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        struct ggml_tensor* node = ggml_graph_node(graph, i);
+        if ((node->flags & GGML_TENSOR_FLAG_INPUT) && node != input_tensor) {
+            size_t nbytes = ggml_nbytes(node);
+            std::vector<uint8_t> zeros(nbytes, 0);
+            ggml_backend_tensor_set(node, zeros.data(), 0, nbytes);
+        }
+    }
+
+    lstm_reset_profile();
+    lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
+
+    if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "ERROR: Graph computation failed\n");
+        ggml_backend_sched_reset(state.sched);
+        return false;
+    }
+
+    const bool ok = fetch_named_tensor_f32(graph, tensor_name, out, info);
+    ggml_backend_sched_reset(state.sched);
+    return ok;
 }
 
 void state_set_backend_stats(segmentation_state& state, bool enable) {
