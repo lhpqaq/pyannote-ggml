@@ -179,23 +179,37 @@ bool extract_embeddings(
             embedding::compute_fbank(cropped.data(), CHUNK_SAMPLES, SAMPLE_RATE);
         const int num_fbank_frames = fbank.num_frames;
 
+        // Optional scratch for CoreML path (row-major masked fbank).
+        std::vector<float> masked_fbank_rowmajor;
+        if (coreml_ctx) {
+            masked_fbank_rowmajor.resize(fbank.data.size());
+        }
+
         // seg layout: [num_chunks, num_frames_per_chunk, num_speakers] row-major
         const float* seg_chunk =
             binarized_segmentations + c * num_frames_per_chunk * num_speakers;
+
+        // Preserve original behavior: if speaker s is all-zero in this chunk, write NaNs and skip.
+        bool speaker_all_zero[16] = {};
+        for (int s = 0; s < num_speakers; s++) {
+            speaker_all_zero[s] = true;
+        }
+        for (int f = 0; f < num_frames_per_chunk; f++) {
+            const float * frame = seg_chunk + f * num_speakers;
+            for (int s = 0; s < num_speakers; s++) {
+                if (frame[s] != 0.0f) {
+                    speaker_all_zero[s] = false;
+                }
+            }
+        }
+
+
 
         for (int s = 0; s < num_speakers; s++) {
             float* emb_out =
                 embeddings_out + (c * num_speakers + s) * EMBEDDING_DIM;
 
-            bool all_zero = true;
-            for (int f = 0; f < num_frames_per_chunk; f++) {
-                if (seg_chunk[f * num_speakers + s] != 0.0f) {
-                    all_zero = false;
-                    break;
-                }
-            }
-
-            if (all_zero) {
+            if (speaker_all_zero[s]) {
                 const float nan_val = std::nanf("");
                 for (int d = 0; d < EMBEDDING_DIM; d++) {
                     emb_out[d] = nan_val;
@@ -203,39 +217,80 @@ bool extract_embeddings(
                 continue;
             }
 
-            std::vector<float> masked_fbank(fbank.data);
+            if (coreml_ctx) {
+                // CoreML expects row-major [T][80].
+                for (int ft = 0; ft < num_fbank_frames; ft++) {
+                    int seg_frame = (int) ((long long) ft * (long long) num_frames_per_chunk / (long long) num_fbank_frames);
+                    if (seg_frame >= num_frames_per_chunk) {
+                        seg_frame = num_frames_per_chunk - 1;
+                    }
 
-            for (int ft = 0; ft < num_fbank_frames; ft++) {
-                // fbank has ~998 frames, seg has 589; map via integer arithmetic
-                int seg_frame =
-                    static_cast<int>(
-                        static_cast<long long>(ft) * num_frames_per_chunk
-                        / num_fbank_frames);
-                if (seg_frame >= num_frames_per_chunk) {
-                    seg_frame = num_frames_per_chunk - 1;
+                    const float mask_val = seg_chunk[seg_frame * num_speakers + s];
+                    const float * src_row = fbank.data.data() + (size_t) ft * FBANK_NUM_BINS;
+                    float * dst_row = masked_fbank_rowmajor.data() + (size_t) ft * FBANK_NUM_BINS;
+
+                    if (mask_val == 0.0f) {
+                        std::memset(dst_row, 0, FBANK_NUM_BINS * sizeof(float));
+                    } else {
+                        std::memcpy(dst_row, src_row, FBANK_NUM_BINS * sizeof(float));
+                    }
                 }
+            } else if (emb_state) {
+                // GGML path expects column-major [80][T] (ne0=T contiguous), so build masked+transposed directly.
+                emb_state->fbank_transposed.resize((size_t) num_fbank_frames * FBANK_NUM_BINS);
+                for (int ft = 0; ft < num_fbank_frames; ft++) {
+                    int seg_frame = (int) ((long long) ft * (long long) num_frames_per_chunk / (long long) num_fbank_frames);
+                    if (seg_frame >= num_frames_per_chunk) {
+                        seg_frame = num_frames_per_chunk - 1;
+                    }
 
-                const float mask_val = seg_chunk[seg_frame * num_speakers + s];
-                if (mask_val == 0.0f) {
-                    std::memset(&masked_fbank[ft * FBANK_NUM_BINS], 0,
-                                FBANK_NUM_BINS * sizeof(float));
+                    const float mask_val = seg_chunk[seg_frame * num_speakers + s];
+                    const float * src_row = fbank.data.data() + (size_t) ft * FBANK_NUM_BINS;
+                    if (mask_val == 0.0f) {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            emb_state->fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = 0.0f;
+                        }
+                    } else {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            emb_state->fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = src_row[b];
+                        }
+                    }
                 }
             }
 
             if (coreml_ctx) {
 #ifdef EMBEDDING_USE_COREML
                 embedding_coreml_encode(coreml_ctx,
-                                        static_cast<int64_t>(num_fbank_frames),
-                                        masked_fbank.data(),
-                                        emb_out);
+                                         static_cast<int64_t>(num_fbank_frames),
+                                         masked_fbank_rowmajor.data(),
+                                         emb_out);
 #else
                 fprintf(stderr, "Error: CoreML embedding requested but EMBEDDING_USE_COREML is disabled\n");
                 return false;
 #endif
             } else if (emb_model && emb_state) {
-                embedding::model_infer(*emb_model, *emb_state,
-                                       masked_fbank.data(), num_fbank_frames,
-                                       emb_out, EMBEDDING_DIM);
+                // Use the transposed buffer directly (avoid per-call transpose).
+                if (!embedding::model_infer_transposed(*emb_model, *emb_state,
+                                                       emb_state->fbank_transposed.data(), num_fbank_frames,
+                                                       emb_out, EMBEDDING_DIM)) {
+                    fprintf(stderr, "Error: GGML embedding failed at chunk %d speaker %d\n", c, s);
+                    const float nan_val = std::nanf("");
+                    for (int d = 0; d < EMBEDDING_DIM; d++) {
+                        emb_out[d] = nan_val;
+                    }
+                }
+
+                if (std::getenv("DIARIZATION_EMB_DEBUG_NAN") != nullptr) {
+                    int nan_count = 0;
+                    for (int d = 0; d < EMBEDDING_DIM; d++) {
+                        if (std::isnan(emb_out[d])) {
+                            nan_count++;
+                        }
+                    }
+                    if (nan_count > 0) {
+                        fprintf(stderr, "[emb] NaNs in embedding: chunk=%d speaker=%d nan=%d/%d\n", c, s, nan_count, EMBEDDING_DIM);
+                    }
+                }
                 backend_nodes_total += emb_state->last_nodes_total;
                 backend_nodes_gpu += emb_state->last_nodes_gpu;
                 backend_nodes_cpu += emb_state->last_nodes_cpu;

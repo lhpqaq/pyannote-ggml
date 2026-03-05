@@ -17,9 +17,24 @@
 namespace embedding {
 
 static int prefer_gpu_for_supported_nodes(embedding_state& state, struct ggml_cgraph* graph) {
-    (void) state;
-    (void) graph;
-    return 0;
+    if (!state.sched || !state.preferred_gpu || !graph) {
+        return 0;
+    }
+    int assigned = 0;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(graph, i);
+        if (!node) {
+            continue;
+        }
+
+        if (ggml_backend_supports_op(state.preferred_gpu, node)) {
+            ggml_backend_sched_set_tensor_backend(state.sched, node, state.preferred_gpu);
+            assigned++;
+        }
+    }
+
+    return assigned;
 }
 
 static void report_gpu_offload_coverage_once(embedding_state& state, struct ggml_cgraph* graph) {
@@ -782,7 +797,15 @@ bool state_init(embedding_state& state,
 
     // Pre-allocate with a representative graph (use 500 frames as typical)
     if (verbose) printf("  Pre-allocating compute buffers...\n");
-    state.num_frames = 500;
+    int prealloc_frames = 1000;
+    if (const char * env = std::getenv("DIARIZATION_EMB_PREALLOC_FRAMES")) {
+        const int v = std::atoi(env);
+        if (v > 0) {
+            prealloc_frames = v;
+        }
+    }
+
+    state.num_frames = prealloc_frames;
     struct ggml_cgraph* graph = build_graph(model, state, state.num_frames);
     if (!graph) {
         fprintf(stderr, "ERROR: Failed to build graph for pre-allocation\n");
@@ -804,6 +827,20 @@ bool state_init(embedding_state& state,
 }
 
 void state_free(embedding_state& state) {
+    if (state.graph_ctx) {
+        ggml_free(state.graph_ctx);
+        state.graph_ctx = nullptr;
+    }
+    state.graph = nullptr;
+    state.input_fbank = nullptr;
+    state.output_embedding = nullptr;
+    state.input_bn_eps = nullptr;
+    state.input_tstp_ones = nullptr;
+    state.input_tstp_t8 = nullptr;
+    state.input_tstp_t8m1 = nullptr;
+    state.input_tstp_eps = nullptr;
+    state.cached_num_frames = 0;
+
     if (state.sched) {
         ggml_backend_sched_free(state.sched);
         state.sched = nullptr;
@@ -820,6 +857,8 @@ void state_free(embedding_state& state) {
 // Graph Building
 // ============================================================================
 
+// Public graph builder kept for existing callers (e.g., state_init pre-allocation).
+// This graph is built with a temporary ggml context allocated from state.graph_meta.
 struct ggml_cgraph* build_graph(
     embedding_model& model,
     embedding_state& state,
@@ -839,9 +878,7 @@ struct ggml_cgraph* build_graph(
 
     struct ggml_cgraph* graph = ggml_new_graph_custom(ctx, MAX_GRAPH_NODES, false);
 
-    // Input: fbank features as 4D tensor [T, 80, 1, 1]
-    struct ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
-                                                    num_frames, 80, 1, 1);
+    struct ggml_tensor* input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, num_frames, 80, 1, 1);
     ggml_set_name(input, "fbank");
     ggml_set_input(input);
 
@@ -851,117 +888,194 @@ struct ggml_cgraph* build_graph(
         return nullptr;
     }
 
+    ggml_set_name(output, "embedding");
     ggml_set_output(output);
     ggml_build_forward_expand(graph, output);
 
     ggml_free(ctx);
-
     return graph;
 }
 
-// ============================================================================
-// Inference
-// ============================================================================
+static bool build_graph_cached(embedding_model & model, embedding_state & state, const int num_frames) {
+    if (state.graph_ctx != nullptr) {
+        ggml_free(state.graph_ctx);
+        state.graph_ctx = nullptr;
+        state.graph = nullptr;
+        state.input_fbank = nullptr;
+        state.output_embedding = nullptr;
+        state.input_bn_eps = nullptr;
+        state.input_tstp_ones = nullptr;
+        state.input_tstp_t8 = nullptr;
+        state.input_tstp_t8m1 = nullptr;
+        state.input_tstp_eps = nullptr;
+    }
 
-bool model_infer(
-    embedding_model& model,
-    embedding_state& state,
-    const float* fbank_data,
-    int num_frames,
-    float* output,
-    size_t output_size) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ state.graph_meta.size(),
+        /*.mem_buffer =*/ state.graph_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
 
-    state.num_frames = num_frames;
-
-    struct ggml_cgraph* graph = build_graph(model, state, num_frames);
-    if (!graph) {
-        fprintf(stderr, "ERROR: Failed to build computation graph\n");
+    state.graph_ctx = ggml_init(params);
+    if (!state.graph_ctx) {
+        fprintf(stderr, "ERROR: Failed to create graph context\n");
         return false;
     }
 
-    prefer_gpu_for_supported_nodes(state, graph);
-    report_gpu_offload_coverage_once(state, graph);
+    state.graph = ggml_new_graph_custom(state.graph_ctx, MAX_GRAPH_NODES, false);
 
-    if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
+    // Input: fbank features as 4D tensor [T, 80, 1, 1]
+    state.input_fbank = ggml_new_tensor_4d(state.graph_ctx, GGML_TYPE_F32, num_frames, 80, 1, 1);
+    ggml_set_name(state.input_fbank, "fbank");
+    ggml_set_input(state.input_fbank);
+
+    struct ggml_tensor * output = model_forward(state.graph_ctx, model, state.input_fbank);
+    if (!output) {
+        ggml_free(state.graph_ctx);
+        state.graph_ctx = nullptr;
+        state.graph = nullptr;
+        state.input_fbank = nullptr;
+        return false;
+    }
+
+    ggml_set_name(output, "embedding");
+    ggml_set_output(output);
+    ggml_build_forward_expand(state.graph, output);
+
+    // Cache helper input tensors by name (may be absent depending on graph).
+    state.output_embedding = ggml_graph_get_tensor(state.graph, "embedding");
+    state.input_bn_eps     = ggml_graph_get_tensor(state.graph, "bn_eps");
+    state.input_tstp_ones  = ggml_graph_get_tensor(state.graph, "tstp_ones");
+    state.input_tstp_t8    = ggml_graph_get_tensor(state.graph, "tstp_t8");
+    state.input_tstp_t8m1  = ggml_graph_get_tensor(state.graph, "tstp_t8m1");
+    state.input_tstp_eps   = ggml_graph_get_tensor(state.graph, "tstp_eps");
+
+    state.cached_num_frames = num_frames;
+    return true;
+}
+
+static bool ensure_graph(embedding_model & model, embedding_state & state, const int num_frames) {
+    // Graph caching is currently opt-in.
+    // Rebuilding the graph each call is more robust with ggml backend scheduler resets.
+    const char * cache_env = std::getenv("DIARIZATION_EMB_CACHE_GRAPH");
+    const bool cache_graph = (cache_env != nullptr) && (std::strcmp(cache_env, "0") != 0);
+
+    if (!cache_graph && state.graph_ctx != nullptr) {
+        ggml_free(state.graph_ctx);
+        state.graph_ctx = nullptr;
+        state.graph = nullptr;
+        state.input_fbank = nullptr;
+        state.output_embedding = nullptr;
+        state.input_bn_eps = nullptr;
+        state.input_tstp_ones = nullptr;
+        state.input_tstp_t8 = nullptr;
+        state.input_tstp_t8m1 = nullptr;
+        state.input_tstp_eps = nullptr;
+        state.cached_num_frames = 0;
+    }
+
+    if (state.graph == nullptr || state.graph_ctx == nullptr || state.cached_num_frames != num_frames) {
+        if (!build_graph_cached(model, state, num_frames)) {
+            fprintf(stderr, "ERROR: Failed to build computation graph\n");
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool model_infer_transposed(
+    embedding_model & model,
+    embedding_state & state,
+    const float * fbank_data_transposed, // [80, T] where leading dim is T
+    int num_frames,
+    float * output,
+    size_t output_size) {
+
+    if (!ensure_graph(model, state, num_frames)) {
+        return false;
+    }
+
+    // NOTE: ggml_backend_sched_reset() is called after each compute.
+    // Therefore we must re-run alloc_graph before every invocation.
+    // We still avoid re-building the graph and re-creating the ggml context.
+    prefer_gpu_for_supported_nodes(state, state.graph);
+    report_gpu_offload_coverage_once(state, state.graph);
+
+    if (!ggml_backend_sched_alloc_graph(state.sched, state.graph)) {
         fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
         return false;
     }
 
-    maybe_dump_backend_assignment_ratio(state, graph);
+    // Set constant helper inputs. This is cheap and avoids relying on buffer persistence.
+    if (state.input_bn_eps) {
+        float eps_val = 1e-5f;
+        ggml_backend_tensor_set(state.input_bn_eps, &eps_val, 0, sizeof(float));
+    }
 
-    // Set fbank input data
-    // fbank_data is (T, 80) row-major: ne[0]=80 varies fastest
-    // But our graph input is [T, 80, 1, 1] where ne[0]=T
-    // We need to transpose: create a transposed copy
-    struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "fbank");
-    if (!input_tensor) {
+    if (state.input_tstp_ones) {
+        const int64_t T8 = state.input_tstp_ones->ne[0];
+        state.ones_buffer.assign((size_t) T8, 1.0f);
+        ggml_backend_tensor_set(state.input_tstp_ones, state.ones_buffer.data(), 0, (size_t) T8 * sizeof(float));
+    }
+
+    if (state.input_tstp_t8) {
+        float t8_val = state.input_tstp_ones ? (float) state.input_tstp_ones->ne[0] : (float) (num_frames / 8);
+        ggml_backend_tensor_set(state.input_tstp_t8, &t8_val, 0, sizeof(float));
+    }
+
+    if (state.input_tstp_t8m1) {
+        float t8_val = state.input_tstp_ones ? (float) state.input_tstp_ones->ne[0] : (float) (num_frames / 8);
+        float t8m1_val = t8_val - 1.0f;
+        if (t8m1_val < 1.0f) t8m1_val = 1.0f;
+        ggml_backend_tensor_set(state.input_tstp_t8m1, &t8m1_val, 0, sizeof(float));
+    }
+
+    if (state.input_tstp_eps) {
+        float eps_val = 1e-10f;
+        ggml_backend_tensor_set(state.input_tstp_eps, &eps_val, 0, sizeof(float));
+    }
+
+    // Zero any other graph inputs we are not explicitly setting.
+    // This makes behavior robust if model_forward introduces new helper inputs.
+    {
+        const int n_nodes = ggml_graph_n_nodes(state.graph);
+        for (int i = 0; i < n_nodes; ++i) {
+            struct ggml_tensor * node = ggml_graph_node(state.graph, i);
+            if (!node) {
+                continue;
+            }
+            if (!(node->flags & GGML_TENSOR_FLAG_INPUT)) {
+                continue;
+            }
+            if (node == state.input_fbank || node == state.input_bn_eps || node == state.input_tstp_ones ||
+                node == state.input_tstp_t8 || node == state.input_tstp_t8m1 || node == state.input_tstp_eps) {
+                continue;
+            }
+            const size_t nbytes = ggml_nbytes(node);
+            if (nbytes == 0) {
+                continue;
+            }
+            std::vector<uint8_t> zeros(nbytes, 0);
+            ggml_backend_tensor_set(node, zeros.data(), 0, nbytes);
+        }
+    }
+
+    if (!state.input_fbank) {
         fprintf(stderr, "ERROR: Input tensor 'fbank' not found in graph\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
 
-    // fbank_data layout: frame0[80], frame1[80], ... (row-major, ne[0]=80 fastest)
-    // We need [T, 80] in GGML where ne[0]=T (column-major)
-    // Reuse transpose buffer to avoid per-chunk allocations.
-    state.fbank_transposed.resize((size_t)num_frames * 80);
-    for (int t = 0; t < num_frames; t++) {
-        for (int b = 0; b < 80; b++) {
-            state.fbank_transposed[(size_t)b * (size_t)num_frames + (size_t)t] = fbank_data[(size_t)t * 80 + (size_t)b];
-        }
-    }
-    ggml_backend_tensor_set(input_tensor, state.fbank_transposed.data(), 0, (size_t)num_frames * 80 * sizeof(float));
-
-    // Set helper input tensors by name
-    auto set_input = [&](const char* name_to_find) -> struct ggml_tensor* {
-        return ggml_graph_get_tensor(graph, name_to_find);
-    };
-
-    // BN epsilon = 1e-5
-    struct ggml_tensor* bn_eps_t = set_input("bn_eps");
-    if (bn_eps_t) {
-        float eps_val = 1e-5f;
-        ggml_backend_tensor_set(bn_eps_t, &eps_val, 0, sizeof(float));
-    }
-
-    // TSTP ones vector
-    struct ggml_tensor* ones_t = set_input("tstp_ones");
-    if (ones_t) {
-        int64_t T8 = ones_t->ne[0];
-        state.ones_buffer.assign((size_t)T8, 1.0f);
-        ggml_backend_tensor_set(ones_t, state.ones_buffer.data(), 0, (size_t)T8 * sizeof(float));
-    }
-
-    // TSTP T8 scalar (number of time steps after layer4)
-    struct ggml_tensor* t8_t = set_input("tstp_t8");
-    if (t8_t) {
-        // T8 is determined by the actual graph — get from ones tensor
-        float t8_val = ones_t ? (float)ones_t->ne[0] : (float)(num_frames / 8);
-        ggml_backend_tensor_set(t8_t, &t8_val, 0, sizeof(float));
-    }
-
-    // TSTP T8-1 scalar (for Bessel's correction)
-    struct ggml_tensor* t8m1_t = set_input("tstp_t8m1");
-    if (t8m1_t) {
-        float t8_val = ones_t ? (float)ones_t->ne[0] : (float)(num_frames / 8);
-        float t8m1_val = t8_val - 1.0f;
-        if (t8m1_val < 1.0f) t8m1_val = 1.0f;
-        ggml_backend_tensor_set(t8m1_t, &t8m1_val, 0, sizeof(float));
-    }
-
-    // TSTP variance epsilon
-    struct ggml_tensor* tstp_eps_t = set_input("tstp_eps");
-    if (tstp_eps_t) {
-        float eps_val = 1e-10f;
-        ggml_backend_tensor_set(tstp_eps_t, &eps_val, 0, sizeof(float));
-    }
+    ggml_backend_tensor_set(state.input_fbank, fbank_data_transposed, 0, (size_t) num_frames * 80 * sizeof(float));
 
     if (state.backend_stats) {
-        ggml_backend_sched_split_graph(state.sched, graph);
-        int n_nodes = ggml_graph_n_nodes(graph);
+        ggml_backend_sched_split_graph(state.sched, state.graph);
+        int n_nodes = ggml_graph_n_nodes(state.graph);
         int n_cpu = 0;
         int n_gpu = 0;
         for (int i = 0; i < n_nodes; ++i) {
-            struct ggml_tensor* node = ggml_graph_node(graph, i);
+            struct ggml_tensor * node = ggml_graph_node(state.graph, i);
             ggml_backend_t b = ggml_backend_sched_get_tensor_backend(state.sched, node);
             if (!b) {
                 continue;
@@ -979,27 +1093,52 @@ bool model_infer(
         state.last_nodes_gpu = n_gpu;
     }
 
-    if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_sched_graph_compute(state.sched, state.graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ERROR: Graph computation failed\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
 
-    struct ggml_tensor* output_tensor = ggml_graph_get_tensor(graph, "embedding");
-    if (!output_tensor) {
+    if (!state.output_embedding) {
         fprintf(stderr, "ERROR: Output tensor 'embedding' not found in graph\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
 
-    size_t output_bytes = ggml_nbytes(output_tensor);
+    size_t output_bytes = ggml_nbytes(state.output_embedding);
     size_t requested_bytes = output_size * sizeof(float);
     size_t copy_bytes = (output_bytes < requested_bytes) ? output_bytes : requested_bytes;
-    ggml_backend_tensor_get(output_tensor, output, 0, copy_bytes);
+    ggml_backend_tensor_get(state.output_embedding, output, 0, copy_bytes);
 
     ggml_backend_sched_reset(state.sched);
-
     return true;
+}
+
+// ============================================================================
+// Inference
+// ============================================================================
+
+bool model_infer(
+    embedding_model& model,
+    embedding_state& state,
+    const float* fbank_data,
+    int num_frames,
+    float* output,
+    size_t output_size) {
+
+    state.num_frames = num_frames;
+
+    // fbank_data is row-major [T][80] for this API.
+    // Transpose into GGML layout [80][T] (ne0=T contiguous).
+    state.fbank_transposed.resize((size_t) num_frames * 80);
+    for (int t = 0; t < num_frames; t++) {
+        for (int b = 0; b < 80; b++) {
+            state.fbank_transposed[(size_t) b * (size_t) num_frames + (size_t) t] =
+                fbank_data[(size_t) t * 80 + (size_t) b];
+        }
+    }
+
+    return model_infer_transposed(model, state, state.fbank_transposed.data(), num_frames, output, output_size);
 }
 
 void state_set_backend_stats(embedding_state& state, bool enable) {

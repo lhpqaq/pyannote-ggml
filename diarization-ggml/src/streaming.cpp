@@ -168,7 +168,15 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
                 embedding[d] = nan_val;
             }
         } else {
-            std::vector<float> masked_fbank(fbank.data);
+            // Build masked fbank for the selected embedding backend.
+            // - CoreML expects row-major [T][80]
+            // - GGML expects column-major [80][T] (ne0=T contiguous)
+            std::vector<float> masked_fbank_rowmajor;
+            if (state->emb_coreml_ctx) {
+                masked_fbank_rowmajor.resize(fbank.data.size());
+            } else {
+                state->emb_state.fbank_transposed.resize((size_t) num_fbank_frames * FBANK_NUM_BINS);
+            }
 
             for (int ft = 0; ft < num_fbank_frames; ft++) {
                 int seg_frame =
@@ -179,9 +187,25 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
                 }
 
                 const float mask_val = chunk_binarized[seg_frame * NUM_LOCAL_SPEAKERS + s];
-                if (mask_val == 0.0f) {
-                    std::memset(&masked_fbank[ft * FBANK_NUM_BINS], 0,
-                               FBANK_NUM_BINS * sizeof(float));
+                const float * src_row = fbank.data.data() + (size_t) ft * FBANK_NUM_BINS;
+
+                if (state->emb_coreml_ctx) {
+                    float * dst_row = masked_fbank_rowmajor.data() + (size_t) ft * FBANK_NUM_BINS;
+                    if (mask_val == 0.0f) {
+                        std::memset(dst_row, 0, FBANK_NUM_BINS * sizeof(float));
+                    } else {
+                        std::memcpy(dst_row, src_row, FBANK_NUM_BINS * sizeof(float));
+                    }
+                } else {
+                    if (mask_val == 0.0f) {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            state->emb_state.fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = 0.0f;
+                        }
+                    } else {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            state->emb_state.fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = src_row[b];
+                        }
+                    }
                 }
             }
 
@@ -190,16 +214,16 @@ static bool process_one_chunk(StreamingState* state, int total_samples) {
             if (state->emb_coreml_ctx) {
                 embedding_coreml_encode(state->emb_coreml_ctx,
                                        static_cast<int64_t>(num_fbank_frames),
-                                       masked_fbank.data(),
+                                       masked_fbank_rowmajor.data(),
                                        embedding.data());
                 emb_ok = true;
             }
 #endif
 
             if (!emb_ok && state->use_emb_ggml) {
-                if (!embedding::model_infer(state->emb_model, state->emb_state,
-                                            masked_fbank.data(), num_fbank_frames,
-                                            embedding.data(), EMBEDDING_DIM)) {
+                if (!embedding::model_infer_transposed(state->emb_model, state->emb_state,
+                                                      state->emb_state.fbank_transposed.data(), num_fbank_frames,
+                                                      embedding.data(), EMBEDDING_DIM)) {
                     fprintf(stderr, "Error: GGML embedding failed\n");
                     return false;
                 }

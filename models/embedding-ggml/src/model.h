@@ -131,6 +131,20 @@ struct embedding_state {
     std::vector<float> fbank_transposed;
     std::vector<float> ones_buffer;
 
+    // Cached graph for a stable num_frames shape.
+    // This avoids rebuilding the ResNet graph and reallocating scheduler buffers
+    // for every embedding extraction call.
+    struct ggml_context * graph_ctx = nullptr;
+    struct ggml_cgraph  * graph = nullptr;
+    struct ggml_tensor  * input_fbank = nullptr;
+    struct ggml_tensor  * output_embedding = nullptr;
+    struct ggml_tensor  * input_bn_eps = nullptr;
+    struct ggml_tensor  * input_tstp_ones = nullptr;
+    struct ggml_tensor  * input_tstp_t8 = nullptr;
+    struct ggml_tensor  * input_tstp_t8m1 = nullptr;
+    struct ggml_tensor  * input_tstp_eps = nullptr;
+    int cached_num_frames = 0;
+
     // Optional backend hit statistics for last graph
     bool backend_stats = false;
     int last_nodes_total = 0;
@@ -248,6 +262,19 @@ bool model_infer(
     int num_frames,
     float* output,
     size_t output_size);
+
+// Variant for callers that already provide GGML-layout fbank.
+// Expects fbank_data_transposed as [80, T] with stride T (i.e., column-major view where ne[0]=T).
+bool model_infer_transposed(
+    embedding_model& model,
+    embedding_state& state,
+    const float* fbank_data_transposed,
+    int num_frames,
+    float* output,
+    size_t output_size);
+
+// If enabled, model_infer/model_infer_transposed expect fbank_data to be a full fbank
+// (no speaker masking is applied internally). External callers can mask as needed.
 
 void state_set_backend_stats(embedding_state& state, bool enable);
 
