@@ -87,6 +87,27 @@ Each lane processes two `k` values at once:
 
 This reduces the number of weight loads and conversion instructions in the hot loop.
 
+## Optimization 4: Remove Per-Step Shared `hp` Cache (Optional)
+
+The warp kernels originally cached the previous hidden vector `hp` into shared memory each timestep.
+This reduces repeated global reads of `hp`, but it adds per-step overhead:
+
+- a block-wide loop that writes `H` floats into shared
+- a `__syncthreads()` per step
+
+On T4, for this specific kernel shape, reading `hp` directly from global memory can be faster.
+
+### Kernel
+
+- `k_pyannote_seg_lstm_dir_coop_warp_h2_nosh<REVERSE, B_T, WARPS_PER_BLOCK>`
+
+### Enable
+
+- `DIARIZATION_SEG_LSTM_COOP_WARP_NOSH=1`
+
+This keeps `grid.sync()` (timestep barrier) but removes the shared-memory staging and the per-step block
+barrier.
+
 ### Numerical effect
 
 Half2 itself is just a load/convert strategy here; the main numerical difference still comes from the parallel
@@ -106,6 +127,10 @@ These are read by the CUDA custom-op:
 - `DIARIZATION_SEG_LSTM_COOP_WARPS={2|4|8|16}`
   - Number of warps per block.
   - T4 recommendation: `4`.
+
+- `DIARIZATION_SEG_LSTM_COOP_WARP_NOSH=1`
+  - Use the no-shared `hp` variant (direct global reads).
+  - T4 observation: often faster than shared `hp` staging.
 
 ### Script defaults
 
