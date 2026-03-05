@@ -7,9 +7,13 @@ if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
     exit 1
 fi
 export DIARIZATION_SEG_LSTM_COOP=1
-export DIARIZATION_SEG_LSTM_COOP=1
-export DIARIZATION_SEG_LSTM_COOP_WARP=1
-export DIARIZATION_SEG_LSTM_COOP_WARPS=4
+
+# Default to the faster cooperative warp-per-hidden kernel on CUDA.
+# Override by setting these env vars before running this script.
+: "${DIARIZATION_SEG_LSTM_COOP_WARP:=1}"
+: "${DIARIZATION_SEG_LSTM_COOP_WARPS:=4}"
+export DIARIZATION_SEG_LSTM_COOP_WARP
+export DIARIZATION_SEG_LSTM_COOP_WARPS
 AUDIO_PATH="$1"
 BACKEND="$2"
 OUTPUT_PATH="${3:-}"
