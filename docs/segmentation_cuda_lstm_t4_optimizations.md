@@ -132,6 +132,31 @@ These are read by the CUDA custom-op:
   - Use the no-shared `hp` variant (direct global reads).
   - T4 observation: often faster than shared `hp` staging.
 
+## Optimization 5: Fused Bidirectional Kernel (Optional)
+
+The baseline implementation runs forward and reverse directions as separate cooperative launches.
+Each direction kernel includes a `grid.sync()` per timestep, so the total barrier count is effectively doubled.
+
+The fused bidirectional kernel computes both directions in a single cooperative launch:
+
+- One cooperative kernel per layer per chunk instead of two
+- One `grid.sync()` per timestep for both directions combined
+
+### Kernel
+
+- `k_pyannote_seg_lstm_bidir_coop_warp_h2_nosh<B_T, WARPS_PER_BLOCK>`
+
+### Enable
+
+- `DIARIZATION_SEG_LSTM_COOP_BIDIR=1`
+
+This mode currently applies only to the warp-per-hidden cooperative path.
+
+### Notes
+
+- Fused bidirectional mode computes the reverse `ih` GEMM before launching the fused kernel.
+- Correctness can be validated via tensor dumps; the fused and separate modes should match.
+
 ### Script defaults
 
 `tools/run-diarization.sh` is set up to default to the faster warp-per-hidden kernel:
