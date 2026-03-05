@@ -53,6 +53,13 @@
   - 目的：把每步 `grid.sync()` 从 “每方向一次（两次）” 降为 “每 timestep 一次”。
   - 当前实现要求 `B==1`（cooperative 模式本身也只在 B==1 生效）。
 
+## Embedding 相关（补充）
+
+Embedding 阶段的 CUDA 优化主要发生在 ggml-cuda 的 conv2d/im2col 路径，不依赖额外运行时开关。
+本文档不逐项列出内核选择逻辑，详细算法与实验协议见：
+
+- `docs/paper_cuda_embedding_optimization_notes_zh.md`
+
 ## 推荐使用方案（从保守到激进）
 
 ### 方案 A：当前最快（T4 推荐）

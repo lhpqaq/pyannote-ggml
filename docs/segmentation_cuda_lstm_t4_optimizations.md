@@ -266,3 +266,16 @@ The best-performing setting in sweeps so far is:
   increases complexity and memory usage.
 - Nsight Compute requires GPU performance counter permissions; if unavailable, only `nsys` timing attribution is
   possible.
+
+## Appendix: Embedding Stage Notes (Pipeline Impact)
+
+Although this document focuses on the segmentation BiLSTM, the end-to-end diarization pipeline on T4 can become
+embedding-dominated after the LSTM recurrence is optimized.
+
+Key observation from `nsys` profiling:
+
+- embedding ResNet conv2d path spends a large fraction of GPU time in `im2col`.
+
+Related optimizations are tracked separately in:
+
+- `docs/paper_cuda_embedding_optimization_notes_zh.md`
