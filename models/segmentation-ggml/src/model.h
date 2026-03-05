@@ -150,6 +150,10 @@ struct segmentation_state {
     lstm_weight_cache lstm_cache;
 
     bool printed_gpu_coverage = false;
+
+    // Debug-only: counts how many inference calls were made on this state.
+    // Used to cap binary tensor dumps via DIARIZATION_SEG_DEBUG_DUMP_MAX.
+    int infer_call_index = 0;
 };
 
 // ============================================================================

@@ -529,6 +529,8 @@ DiarizationResult streaming_recluster(StreamingState* state) {
     }
     
     const int num_chunks = state->chunks_processed;
+
+    const int total_emb = num_chunks * NUM_LOCAL_SPEAKERS;
     
     // Filter embeddings (same as offline pipeline)
     std::vector<float> filtered_emb;
@@ -546,7 +548,7 @@ DiarizationResult streaming_recluster(StreamingState* state) {
 
     
     const int num_filtered = static_cast<int>(filt_chunk_idx.size());
-    
+
     if (num_filtered < 2) {
         state->num_speakers = (num_filtered > 0) ? 1 : 0;
         state->last_recluster_chunk = state->chunks_processed;
@@ -605,7 +607,7 @@ DiarizationResult streaming_recluster(StreamingState* state) {
             num_ahc_clusters = ahc_clusters[i] + 1;
         }
     }
-    
+
     // Free L2-normalized embeddings
     filtered_normed.clear();
     filtered_normed.shrink_to_fit();
@@ -637,7 +639,7 @@ DiarizationResult streaming_recluster(StreamingState* state) {
     }
     int num_clusters = static_cast<int>(sig_speakers.size());
     if (num_clusters == 0) num_clusters = 1;  // fallback
-    
+
     std::vector<float> centroids(
         static_cast<size_t>(num_clusters) * EMBEDDING_DIM, 0.0f);
     std::vector<double> w_col_sum(num_clusters, 0.0);
@@ -664,7 +666,6 @@ DiarizationResult streaming_recluster(StreamingState* state) {
         }
     }
     
-    const int total_emb = num_chunks * NUM_LOCAL_SPEAKERS;
     std::vector<float> soft_clusters(
         static_cast<size_t>(total_emb) * num_clusters);
     
@@ -775,7 +776,9 @@ DiarizationResult streaming_recluster(StreamingState* state) {
         static_cast<int>(discrete_diarization.size()) / num_clusters;
     
     for (int k = 0; k < num_clusters; k++) {
-        char speaker_label[16];
+        // %02d specifies a minimum width, not a maximum; use a larger buffer
+        // to avoid fortify truncation warnings for large k.
+        char speaker_label[32];
         snprintf(speaker_label, sizeof(speaker_label), "SPEAKER_%02d", k);
         
         bool in_segment = false;

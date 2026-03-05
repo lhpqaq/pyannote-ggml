@@ -949,35 +949,39 @@ bool model_infer(
     size_t n_samples,
     float* output,
     size_t output_size) {
-    
-    auto prof_start = std::chrono::high_resolution_clock::now();
-    
+
     struct ggml_cgraph* graph = build_graph(model, state);
     if (!graph) {
         fprintf(stderr, "ERROR: Failed to build computation graph\n");
         return false;
     }
-    
-    auto prof_graph_built = std::chrono::high_resolution_clock::now();
-    
+
     prefer_gpu_for_supported_nodes(state, graph);
     report_gpu_offload_coverage_once(state, graph);
 
+    // Ensure scheduler has valid buffers/tensor placements for this graph.
     if (!ggml_backend_sched_alloc_graph(state.sched, graph)) {
         fprintf(stderr, "ERROR: Failed to allocate compute buffers\n");
         return false;
     }
 
-    auto prof_alloc_done = std::chrono::high_resolution_clock::now();
-    
     struct ggml_tensor* input_tensor = ggml_graph_get_tensor(graph, "waveform");
     if (!input_tensor) {
         fprintf(stderr, "ERROR: Input tensor 'waveform' not found in graph\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
-    ggml_backend_tensor_set(input_tensor, audio, 0, n_samples * sizeof(float));
-    
+
+    // Set fixed-size input (pad if needed).
+    const size_t want_samples = 160000;
+    const size_t copy_samples = n_samples < want_samples ? n_samples : want_samples;
+    ggml_backend_tensor_set(input_tensor, audio, 0, copy_samples * sizeof(float));
+    if (copy_samples < want_samples) {
+        std::vector<float> zeros(want_samples - copy_samples, 0.0f);
+        ggml_backend_tensor_set(input_tensor, zeros.data(), copy_samples * sizeof(float), zeros.size() * sizeof(float));
+    }
+
+    // Ensure any other graph inputs are zeroed.
     for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
         struct ggml_tensor* node = ggml_graph_node(graph, i);
         if ((node->flags & GGML_TENSOR_FLAG_INPUT) && node != input_tensor) {
@@ -986,36 +990,49 @@ bool model_infer(
             ggml_backend_tensor_set(node, zeros.data(), 0, nbytes);
         }
     }
-    
-    auto prof_input_set = std::chrono::high_resolution_clock::now();
-    
+
     lstm_reset_profile();
     lstm_set_active_cache(state.lstm_cache.initialized ? &state.lstm_cache : nullptr);
-    
+
     if (ggml_backend_sched_graph_compute(state.sched, graph) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ERROR: Graph computation failed\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
-    
-    auto prof_compute_done = std::chrono::high_resolution_clock::now();
-    
+
     struct ggml_tensor* output_tensor = ggml_graph_get_tensor(graph, "classifier_out");
     if (!output_tensor) {
         fprintf(stderr, "ERROR: Output tensor 'classifier_out' not found in graph\n");
         ggml_backend_sched_reset(state.sched);
         return false;
     }
-    
+
     size_t output_bytes = ggml_nbytes(output_tensor);
     size_t requested_bytes = output_size * sizeof(float);
     size_t copy_bytes = (output_bytes < requested_bytes) ? output_bytes : requested_bytes;
     ggml_backend_tensor_get(output_tensor, output, 0, copy_bytes);
 
+    if (const char * dump_dir = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_DIR")) {
+        int dump_max = 1;
+        if (const char * dump_max_env = std::getenv("DIARIZATION_SEG_DEBUG_DUMP_MAX")) {
+            const int parsed = std::atoi(dump_max_env);
+            if (parsed > 0) {
+                dump_max = parsed;
+            }
+        }
+
+        if (state.infer_call_index < dump_max) {
+            dump_tensor_binary(graph, "lstm_out_cont", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "linear1_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "linear2_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "classifier_mm", dump_dir, state.infer_call_index);
+            dump_tensor_binary(graph, "classifier_out", dump_dir, state.infer_call_index);
+        }
+    }
+
+    state.infer_call_index++;
+
     ggml_backend_sched_reset(state.sched);
-    
-    auto prof_end = std::chrono::high_resolution_clock::now();
-    
     return true;
 }
 

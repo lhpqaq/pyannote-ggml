@@ -7,6 +7,9 @@ if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
     exit 1
 fi
 export DIARIZATION_SEG_LSTM_COOP=1
+export DIARIZATION_SEG_LSTM_COOP=1
+export DIARIZATION_SEG_LSTM_COOP_WARP=1
+export DIARIZATION_SEG_LSTM_COOP_WARPS=4
 AUDIO_PATH="$1"
 BACKEND="$2"
 OUTPUT_PATH="${3:-}"
