@@ -118,7 +118,15 @@ class PyanNetWrapper(nn.Module):
 
 
 def main():
+    import argparse
     import coremltools as ct
+
+    parser = argparse.ArgumentParser(description="Convert PyanNet segmentation to CoreML")
+    parser.add_argument("--batch", type=int, default=0,
+                        help="Max batch size for batch inference (0 = fixed batch=1)")
+    parser.add_argument("--precision", choices=["fp32", "fp16"], default="fp32",
+                        help="CoreML compute precision")
+    args = parser.parse_args()
 
     print("=" * 60)
     print("PyanNet Segmentation → CoreML Conversion")
@@ -187,14 +195,22 @@ def main():
     # ------------------------------------------------------------------
     print("\n[4/6] Converting to CoreML (.mlpackage)...")
 
-    # Fixed input shape: (1, 1, 160000) — always 10s chunks
+    precision_enum = ct.precision.FLOAT16 if args.precision == "fp16" else ct.precision.FLOAT32
+
+    if args.batch > 0:
+        input_spec = [ct.TensorType(name="waveform",
+                                     shape=(ct.RangeDim(1, args.batch, default=1), 1, 160000))]
+        print(f"  Batch mode: variable batch 1..{args.batch}")
+    else:
+        input_spec = [ct.TensorType(name="waveform", shape=(1, 1, 160000))]
+
     mlmodel = ct.convert(
         traced_model,
-        inputs=[ct.TensorType(name="waveform", shape=(1, 1, 160000))],
+        inputs=input_spec,
         outputs=[ct.TensorType(name="log_probabilities")],
         convert_to="mlprogram",
         minimum_deployment_target=ct.target.macOS13,
-        compute_precision=ct.precision.FLOAT32,
+        compute_precision=precision_enum,
         compute_units=ct.ComputeUnit.ALL,
     )
     print("  CoreML conversion successful")
@@ -202,7 +218,12 @@ def main():
     # ------------------------------------------------------------------
     # Step 5: Save .mlpackage
     # ------------------------------------------------------------------
-    output_path = Path(__file__).parent / "segmentation.mlpackage"
+    suffix = ""
+    if args.batch > 0:
+        suffix += f"_batch{args.batch}"
+    if args.precision == "fp16":
+        suffix += "_fp16"
+    output_path = Path(__file__).parent / f"segmentation{suffix}.mlpackage"
     print(f"\n[5/6] Saving to {output_path}...")
     mlmodel.save(str(output_path))
     print(f"  Saved: {output_path}")

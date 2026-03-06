@@ -1,6 +1,12 @@
 #include "clustering.h"
 #include "fastcluster/fastcluster.h"
 
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+
 #include <cmath>
 #include <vector>
 #include <numeric>
@@ -390,14 +396,21 @@ void ahc_cluster(const double* embeddings, int n, int dim,
     size_t condensed_size = (size_t)n * (n - 1) / 2;
     std::vector<double> distmat(condensed_size);
 
+    // Compute gram matrix G = X @ X^T via BLAS, then convert to Euclidean distances.
+    // Input embeddings are L2-normalized, so ||a-b||² = 2(1 - a·b).
+    std::vector<double> gram(static_cast<size_t>(n) * n);
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                n, n, dim,
+                1.0, embeddings, dim,
+                embeddings, dim,
+                0.0, gram.data(), n);
+
     size_t idx = 0;
     for (int i = 0; i < n; i++) {
         for (int j = i + 1; j < n; j++) {
-            double dist_sq = 0.0;
-            for (int d = 0; d < dim; d++) {
-                double diff = embeddings[i * dim + d] - embeddings[j * dim + d];
-                dist_sq += diff * diff;
-            }
+            double dot = gram[static_cast<size_t>(i) * n + j];
+            double dist_sq = 2.0 * (1.0 - dot);
+            if (dist_sq < 0.0) dist_sq = 0.0;
             distmat[idx++] = std::sqrt(dist_sq);
         }
     }

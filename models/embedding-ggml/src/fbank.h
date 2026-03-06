@@ -22,9 +22,16 @@ struct fbank_result {
  * - snip_edges=True (Kaldi default)
  * - sample_rate=16000
  * - Waveform must be pre-scaled by 32768 (int16 range) before calling
- * - After fbank, subtract global mean per utterance (CMN)
+ * - After fbank, subtract global mean per utterance (CMN) unless apply_cmn=false
  */
-fbank_result compute_fbank(const float* audio, int num_samples, int sample_rate = 16000);
+fbank_result compute_fbank(const float* audio, int num_samples,
+                           int sample_rate = 16000, bool apply_cmn = true);
+
+/**
+ * Apply per-window CMN to a slice of raw fbank features.
+ * Subtracts the mean of the given frames per frequency bin.
+ */
+void apply_cmn(float* data, int num_frames, int num_bins = 80);
 
 } // namespace embedding
 
