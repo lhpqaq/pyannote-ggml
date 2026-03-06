@@ -70,7 +70,13 @@ class ResNetEmbeddingWrapper(nn.Module):
 
 
 def main():
+    import argparse
     import coremltools as ct
+
+    parser = argparse.ArgumentParser(description="Convert WeSpeaker ResNet34 to CoreML")
+    parser.add_argument("--batch", type=int, default=0,
+                        help="Max batch size for batch inference (0 = fixed batch=1)")
+    args = parser.parse_args()
 
     print("=" * 60)
     print("WeSpeaker ResNet34 → CoreML Conversion")
@@ -119,13 +125,19 @@ def main():
 
     print("\n[4/6] Converting to CoreML (.mlpackage)...")
 
-    input_shape = ct.Shape(
-        shape=(
+    if args.batch > 0:
+        input_shape = ct.Shape(shape=(
+            ct.RangeDim(lower_bound=1, upper_bound=args.batch, default=1),
+            ct.RangeDim(lower_bound=100, upper_bound=2000, default=998),
+            80,
+        ))
+        print(f"  Batch mode: variable batch 1..{args.batch}")
+    else:
+        input_shape = ct.Shape(shape=(
             1,
             ct.RangeDim(lower_bound=100, upper_bound=2000, default=998),
             80,
-        )
-    )
+        ))
 
     mlmodel = ct.convert(
         traced_model,
@@ -138,7 +150,10 @@ def main():
     )
     print("  CoreML conversion successful")
 
-    output_path = Path("embedding.mlpackage")
+    suffix = ""
+    if args.batch > 0:
+        suffix += f"_batch{args.batch}"
+    output_path = Path(f"embedding{suffix}.mlpackage")
     print(f"\n[5/6] Saving to {output_path}...")
     mlmodel.save(str(output_path))
     print(f"  Saved: {output_path}")

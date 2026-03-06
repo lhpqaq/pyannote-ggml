@@ -21,16 +21,20 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ============================================================================
@@ -314,6 +318,177 @@ bool extract_embeddings(
 }
 
 // ============================================================================
+// Parallel seg+emb pipeline (CoreML only)
+// ============================================================================
+
+#if defined(SEGMENTATION_USE_COREML) && defined(EMBEDDING_USE_COREML)
+static bool pipeline_parallel_seg_emb(
+    struct segmentation_coreml_context* seg_ctx,
+    struct embedding_coreml_context* emb_ctx,
+    const float* audio, int n_samples, int num_chunks,
+    float* binarized_out,
+    float* embeddings_out,
+    double& t_seg_ms, double& t_emb_ms)
+{
+    using Clock = std::chrono::high_resolution_clock;
+
+    std::atomic<int> chunks_segmented{0};
+    std::mutex mtx;
+    std::condition_variable cv;
+    double seg_time = 0.0;
+
+    std::vector<float> seg_logits(
+        static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+
+    fprintf(stderr, "Segmentation+Embedding (parallel): %d chunks... ", num_chunks);
+    fflush(stderr);
+
+    // Producer: segmentation + per-chunk powerset
+    std::thread seg_thread([&] {
+        auto t0 = Clock::now();
+        std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
+
+        for (int c = 0; c < num_chunks; c++) {
+            const int chunk_start = c * STEP_SAMPLES;
+            int copy_len = n_samples - chunk_start;
+            if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
+            if (copy_len < 0) copy_len = 0;
+
+            std::fill(cropped.begin(), cropped.end(), 0.0f);
+            if (copy_len > 0) {
+                std::memcpy(cropped.data(), audio + chunk_start,
+                            static_cast<size_t>(copy_len) * sizeof(float));
+            }
+
+            float* logits_out = seg_logits.data() +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+
+            segmentation_coreml_infer(seg_ctx,
+                                      cropped.data(), CHUNK_SAMPLES,
+                                      logits_out,
+                                      FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+
+            float* bin_out = binarized_out +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS;
+            diarization::powerset_to_multilabel(logits_out, 1, FRAMES_PER_CHUNK, bin_out);
+
+            chunks_segmented.store(c + 1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+            }
+            cv.notify_one();
+
+            if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {
+                fprintf(stderr, "%d/%d chunks", c + 1, num_chunks);
+                fflush(stderr);
+            }
+        }
+
+        seg_time = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    });
+
+    // Consumer: precompute global fbank, then masked embedding extraction
+    auto t_emb_start = Clock::now();
+    {
+        // Precompute global fbank (without CMN) on zero-padded audio.
+        // Chunks overlap 90% (10s windows, 1s step), so computing once
+        // avoids ~10x redundant FFT/mel work.
+        const int padded_len = (num_chunks - 1) * STEP_SAMPLES + CHUNK_SAMPLES;
+        std::vector<float> padded_audio(padded_len, 0.0f);
+        const int copy_len = std::min(padded_len, n_samples);
+        if (copy_len > 0) {
+            std::memcpy(padded_audio.data(), audio, static_cast<size_t>(copy_len) * sizeof(float));
+        }
+
+        embedding::fbank_result global_fbank =
+            embedding::compute_fbank(padded_audio.data(), padded_len, SAMPLE_RATE, false);
+
+        // Each chunk c maps to global fbank frames [c*FBANK_STEP .. c*FBANK_STEP + nf_per_chunk - 1]
+        // where FBANK_STEP = STEP_SAMPLES / frame_shift_samples = 16000 / 160 = 100
+        static constexpr int FBANK_STEP = STEP_SAMPLES / 160;  // 100 frames per chunk step
+
+        // Compute nf_per_chunk from the first chunk's frame count
+        const int nf_per_chunk = std::min(
+            static_cast<int>((CHUNK_SAMPLES - 400) / 160) + 1,  // 998 for 160000 samples
+            global_fbank.num_frames);
+
+        std::vector<float> chunk_fbank(static_cast<size_t>(nf_per_chunk) * FBANK_NUM_BINS);
+        std::vector<float> masked_fbank(static_cast<size_t>(nf_per_chunk) * FBANK_NUM_BINS);
+
+        for (int c = 0; c < num_chunks; c++) {
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] {
+                    return chunks_segmented.load(std::memory_order_acquire) > c;
+                });
+            }
+
+            // Extract this chunk's fbank frames from the global fbank and apply per-chunk CMN
+            const int frame_offset = c * FBANK_STEP;
+            const int nf = std::min(nf_per_chunk, global_fbank.num_frames - frame_offset);
+            std::memcpy(chunk_fbank.data(),
+                        global_fbank.data.data() + static_cast<size_t>(frame_offset) * FBANK_NUM_BINS,
+                        static_cast<size_t>(nf) * FBANK_NUM_BINS * sizeof(float));
+            embedding::apply_cmn(chunk_fbank.data(), nf, FBANK_NUM_BINS);
+
+            const float* seg_chunk = binarized_out +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS;
+
+            bool speaker_zero[NUM_LOCAL_SPEAKERS];
+            for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) speaker_zero[s] = true;
+            for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
+                const float* frame = seg_chunk + f * NUM_LOCAL_SPEAKERS;
+                for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) {
+                    if (frame[s] != 0.0f) speaker_zero[s] = false;
+                }
+            }
+
+            for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) {
+                float* emb_out = embeddings_out +
+                    (c * NUM_LOCAL_SPEAKERS + s) * EMBEDDING_DIM;
+
+                if (speaker_zero[s]) {
+                    const float nan_val = std::nanf("");
+                    for (int d = 0; d < EMBEDDING_DIM; d++) emb_out[d] = nan_val;
+                    continue;
+                }
+
+                for (int ft = 0; ft < nf; ft++) {
+                    int seg_frame = static_cast<int>(
+                        static_cast<long long>(ft) * FRAMES_PER_CHUNK / nf);
+                    if (seg_frame >= FRAMES_PER_CHUNK) seg_frame = FRAMES_PER_CHUNK - 1;
+
+                    const float mask = seg_chunk[seg_frame * NUM_LOCAL_SPEAKERS + s];
+                    const float* src = chunk_fbank.data() + static_cast<size_t>(ft) * FBANK_NUM_BINS;
+                    float* dst = masked_fbank.data() + static_cast<size_t>(ft) * FBANK_NUM_BINS;
+
+                    if (mask == 0.0f) {
+                        std::memset(dst, 0, FBANK_NUM_BINS * sizeof(float));
+                    } else {
+                        std::memcpy(dst, src, FBANK_NUM_BINS * sizeof(float));
+                    }
+                }
+
+                embedding_coreml_encode(emb_ctx,
+                                         static_cast<int64_t>(nf),
+                                         masked_fbank.data(),
+                                         emb_out);
+            }
+        }
+    }
+    auto t_emb_end = Clock::now();
+
+    seg_thread.join();
+
+    t_seg_ms = seg_time;
+    t_emb_ms = std::chrono::duration<double, std::milli>(t_emb_end - t_emb_start).count();
+
+    fprintf(stderr, "done [seg %.0f ms | emb %.0f ms | parallel]\n", t_seg_ms, t_emb_ms);
+    return true;
+}
+#endif
+
+// ============================================================================
 // URI extraction — filename without extension
 // ============================================================================
 
@@ -504,15 +679,45 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     t_load_plda_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
 
     // ====================================================================
-    // Step 5: Sliding window segmentation
+    // Step 5: Sliding window segmentation + embedding
     // ====================================================================
 
-    t_stage_start = Clock::now();
-    int num_chunks;
-    std::vector<float> seg_logits;
-
-    num_chunks = std::max(1,
+    int num_chunks = std::max(1,
         1 + static_cast<int>(std::ceil((audio_duration - CHUNK_DURATION) / CHUNK_STEP)));
+
+    // Outer-scope buffers shared by parallel and sequential paths
+    std::vector<float> seg_logits;
+    std::vector<float> binarized(
+        static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS);
+    std::vector<float> embeddings;
+    bool parallel_done = false;
+
+#if defined(SEGMENTATION_USE_COREML) && defined(EMBEDDING_USE_COREML)
+    if (use_seg_coreml && use_emb_coreml && !config.bypass_embeddings) {
+        t_stage_start = Clock::now();
+        embeddings.resize(
+            static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
+
+        if (!pipeline_parallel_seg_emb(seg_coreml_ctx, coreml_ctx,
+                                       audio, n_samples, num_chunks,
+                                       binarized.data(), embeddings.data(),
+                                       t_segmentation_ms, t_embeddings_ms)) {
+            goto cleanup;
+        }
+        t_powerset_ms = 0.0;
+
+        segmentation_coreml_free(seg_coreml_ctx);
+        seg_coreml_ctx = nullptr;
+        embedding_coreml_free(coreml_ctx);
+        coreml_ctx = nullptr;
+
+        parallel_done = true;
+    }
+#endif
+
+    if (!parallel_done) {
+    // --- Sequential segmentation ---
+    t_stage_start = Clock::now();
     fprintf(stderr, "Segmentation: %d chunks... ", num_chunks);
     fflush(stderr);
 
@@ -542,7 +747,6 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                                           cropped.data(), CHUNK_SAMPLES,
                                           output,
                                           FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
-                // CoreML output is already frame-major [589][7] — no transpose needed
             } else
 #endif
             {
@@ -556,8 +760,6 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                 }
 
                 // Transpose GGML output from [class, frame] to [frame, class] layout
-                // GGML stores [589, 7, 1] with ne[0]=589 contiguous, so memory is [7][589]
-                // powerset_to_multilabel expects [589][7] (frame-major)
                 {
                     std::vector<float> tmp(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
                     std::memcpy(tmp.data(), output, tmp.size() * sizeof(float));
@@ -593,25 +795,19 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     t_segmentation_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
     fprintf(stderr, "done [%.0f ms]\n", t_segmentation_ms);
 
+    // --- Sequential powerset ---
+    t_stage_start = Clock::now();
+    diarization::powerset_to_multilabel(
+        seg_logits.data(), num_chunks, FRAMES_PER_CHUNK, binarized.data());
+    seg_logits.clear();
+    seg_logits.shrink_to_fit();
+    t_stage_end = Clock::now();
+    t_powerset_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
+    fprintf(stderr, "Powerset: done [%.0f ms]\n", t_powerset_ms);
+
+    } // end if (!parallel_done) — sequential seg + powerset
+
     {
-        // ================================================================
-        // Step 6: Powerset -> multilabel
-        // (num_chunks, 589, 7) -> (num_chunks, 589, 3)
-        // ================================================================
-
-        t_stage_start = Clock::now();
-        std::vector<float> binarized(
-            static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS);
-        diarization::powerset_to_multilabel(
-            seg_logits.data(), num_chunks, FRAMES_PER_CHUNK, binarized.data());
-
-        // Free logits — no longer needed
-        seg_logits.clear();
-        seg_logits.shrink_to_fit();
-        
-        t_stage_end = Clock::now();
-        t_powerset_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
-        fprintf(stderr, "Powerset: done [%.0f ms]\n", t_powerset_ms);
 
         // ================================================================
         // Step 7: Compute frame-level speaker count
@@ -670,8 +866,9 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             // (num_chunks, 3, 256)
             // ================================================================
 
+            if (!parallel_done) {
             t_stage_start = Clock::now();
-            std::vector<float> embeddings(
+            embeddings.resize(
                 static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
 
             fprintf(stderr, "Embeddings: %d chunks... ", num_chunks);
@@ -703,6 +900,7 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
                 emb_state.sched = nullptr;
                 emb_model.ctx = nullptr;
             }
+            } // end if (!parallel_done) — sequential embeddings
 
             // ================================================================
             // Step 9: Filter embeddings
@@ -1135,71 +1333,27 @@ bool diarize_from_samples_with_models(
             audio_duration, audio_mins, audio_secs, n_samples);
 
     // ====================================================================
-    // Step 1: Sliding window segmentation (CoreML)
+    // Step 1: Sliding window segmentation + embedding (parallel)
     // ====================================================================
 
-    t_stage_start = Clock::now();
     int num_chunks = std::max(1,
         1 + static_cast<int>(std::ceil((audio_duration - CHUNK_DURATION) / CHUNK_STEP)));
-    fprintf(stderr, "Segmentation: %d chunks... ", num_chunks);
-    fflush(stderr);
 
-    std::vector<float> seg_logits(
-        static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+    std::vector<float> binarized(
+        static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS);
+    std::vector<float> embeddings(
+        static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
 
-    {
-        std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
-        for (int c = 0; c < num_chunks; c++) {
-            const int chunk_start = c * STEP_SAMPLES;
-            int copy_len = n_samples - chunk_start;
-            if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
-            if (copy_len < 0) copy_len = 0;
-
-            std::fill(cropped.begin(), cropped.end(), 0.0f);
-            if (copy_len > 0) {
-                std::memcpy(cropped.data(), audio + chunk_start,
-                            static_cast<size_t>(copy_len) * sizeof(float));
-            }
-
-            float* output = seg_logits.data() +
-                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
-
-            segmentation_coreml_infer(seg_ctx,
-                                      cropped.data(), CHUNK_SAMPLES,
-                                      output,
-                                      FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
-
-            if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {
-                fprintf(stderr, "%d/%d chunks\r", c + 1, num_chunks);
-                fflush(stderr);
-            }
-        }
-    }
-
-    t_stage_end = Clock::now();
-    t_segmentation_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
-    fprintf(stderr, "done [%.0f ms]\n", t_segmentation_ms);
+    t_stage_start = Clock::now();
+    pipeline_parallel_seg_emb(seg_ctx, emb_ctx,
+                              audio, n_samples, num_chunks,
+                              binarized.data(), embeddings.data(),
+                              t_segmentation_ms, t_embeddings_ms);
+    t_powerset_ms = 0.0;
 
     {
         // ================================================================
-        // Step 2: Powerset -> multilabel
-        // ================================================================
-
-        t_stage_start = Clock::now();
-        std::vector<float> binarized(
-            static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS);
-        diarization::powerset_to_multilabel(
-            seg_logits.data(), num_chunks, FRAMES_PER_CHUNK, binarized.data());
-
-        seg_logits.clear();
-        seg_logits.shrink_to_fit();
-
-        t_stage_end = Clock::now();
-        t_powerset_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
-        fprintf(stderr, "Powerset: done [%.0f ms]\n", t_powerset_ms);
-
-        // ================================================================
-        // Step 3: Compute frame-level speaker count
+        // Step 2: Compute frame-level speaker count
         // ================================================================
 
         t_stage_start = Clock::now();
@@ -1235,31 +1389,6 @@ bool diarize_from_samples_with_models(
 
         fprintf(stderr, "Speaker count: max %d speakers, %d frames [%.0f ms]\n",
                 max_count, total_frames, t_speaker_count_ms);
-
-        // ================================================================
-        // Step 4: Extract embeddings (CoreML)
-        // ================================================================
-
-        t_stage_start = Clock::now();
-        std::vector<float> embeddings(
-            static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
-
-        fprintf(stderr, "Embeddings: %d chunks... ", num_chunks);
-        fflush(stderr);
-        if (!extract_embeddings(
-                audio, n_samples,
-                binarized.data(), num_chunks, FRAMES_PER_CHUNK, NUM_LOCAL_SPEAKERS,
-                emb_ctx,
-                nullptr,
-                nullptr,
-                embeddings.data())) {
-            fprintf(stderr, "Error: embedding extraction failed\n");
-            return false;
-        }
-
-        t_stage_end = Clock::now();
-        t_embeddings_ms = std::chrono::duration<double, std::milli>(t_stage_end - t_stage_start).count();
-        fprintf(stderr, "done [%.0f ms]\n", t_embeddings_ms);
 
         // ================================================================
         // Step 5: Filter embeddings + PLDA + Clustering

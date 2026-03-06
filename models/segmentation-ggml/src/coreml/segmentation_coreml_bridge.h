@@ -22,6 +22,18 @@ void segmentation_coreml_infer(
     float * output,
     int32_t output_size);
 
+// Batch inference: process multiple waveforms in one call.
+// Requires a batch-capable model (exported with --batch).
+// audio_batch: [batch_size * n_samples] contiguous
+// output_batch: [batch_size * output_per_sample] contiguous
+void segmentation_coreml_infer_batch(
+    const struct segmentation_coreml_context * ctx,
+    float * audio_batch,
+    int32_t batch_size,
+    int32_t n_samples,
+    float * output_batch,
+    int32_t output_per_sample);
+
 #ifdef __cplusplus
 }
 #endif

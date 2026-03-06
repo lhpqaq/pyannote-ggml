@@ -23,6 +23,18 @@ void embedding_coreml_encode(
     float * fbank_data,
     float * embedding_out);
 
+// Batch inference: process multiple fbank inputs in one call.
+// Requires a batch-capable model (exported with --batch).
+// All items must have the same num_frames.
+// fbank_batch: [batch_size * num_frames * 80] contiguous
+// embedding_batch: [batch_size * 256] contiguous
+void embedding_coreml_encode_batch(
+    const struct embedding_coreml_context * ctx,
+    int64_t num_frames,
+    int32_t batch_size,
+    float * fbank_batch,
+    float * embedding_batch);
+
 #ifdef __cplusplus
 }
 #endif

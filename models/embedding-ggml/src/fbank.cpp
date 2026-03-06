@@ -5,7 +5,7 @@
 
 namespace embedding {
 
-fbank_result compute_fbank(const float* audio, int num_samples, int sample_rate) {
+fbank_result compute_fbank(const float* audio, int num_samples, int sample_rate, bool apply_cmn_flag) {
     constexpr int NUM_BINS = 80;
 
     knf::FbankOptions opts;
@@ -44,23 +44,29 @@ fbank_result compute_fbank(const float* audio, int num_samples, int sample_rate)
         std::memcpy(result.data.data() + t * NUM_BINS, frame, NUM_BINS * sizeof(float));
     }
 
-    // CMN: subtract global mean per frequency bin across all frames
-    std::vector<float> mean(NUM_BINS, 0.0f);
-    for (int t = 0; t < T; t++) {
-        for (int b = 0; b < NUM_BINS; b++) {
-            mean[b] += result.data[t * NUM_BINS + b];
-        }
-    }
-    for (int b = 0; b < NUM_BINS; b++) {
-        mean[b] /= static_cast<float>(T);
-    }
-    for (int t = 0; t < T; t++) {
-        for (int b = 0; b < NUM_BINS; b++) {
-            result.data[t * NUM_BINS + b] -= mean[b];
-        }
+    if (apply_cmn_flag) {
+        apply_cmn(result.data.data(), T, NUM_BINS);
     }
 
     return result;
+}
+
+void apply_cmn(float* data, int num_frames, int num_bins) {
+    std::vector<float> mean(num_bins, 0.0f);
+    for (int t = 0; t < num_frames; t++) {
+        for (int b = 0; b < num_bins; b++) {
+            mean[b] += data[t * num_bins + b];
+        }
+    }
+    const float inv_t = 1.0f / static_cast<float>(num_frames);
+    for (int b = 0; b < num_bins; b++) {
+        mean[b] *= inv_t;
+    }
+    for (int t = 0; t < num_frames; t++) {
+        for (int b = 0; b < num_bins; b++) {
+            data[t * num_bins + b] -= mean[b];
+        }
+    }
 }
 
 } // namespace embedding
