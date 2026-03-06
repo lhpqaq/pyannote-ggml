@@ -161,33 +161,49 @@ bool extract_embeddings(
     embedding::embedding_state* emb_state,
     float*       embeddings_out)
 {
-    std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
-
     int backend_nodes_total = 0;
     int backend_nodes_gpu = 0;
     int backend_nodes_cpu = 0;
 
+    // --- Global fbank precomputation (avoid ~10x redundant FFT/mel for overlapping chunks) ---
+    // Adjacent chunks overlap 90% (10s window, 1s step). Computing fbank once on
+    // zero-padded full audio and slicing per chunk is mathematically equivalent to
+    // computing per chunk individually, since fbank is a per-frame local operation.
+    static constexpr int FBANK_FRAME_SHIFT = 160;  // 10ms at 16kHz
+    static constexpr int FBANK_STEP = STEP_SAMPLES / FBANK_FRAME_SHIFT;  // 100 frames per chunk step
+
+    const int padded_len = (num_chunks - 1) * STEP_SAMPLES + CHUNK_SAMPLES;
+    std::vector<float> padded_audio(padded_len, 0.0f);
+    const int copy_len = std::min(padded_len, num_samples);
+    if (copy_len > 0) {
+        std::memcpy(padded_audio.data(), audio, static_cast<size_t>(copy_len) * sizeof(float));
+    }
+
+    embedding::fbank_result global_fbank =
+        embedding::compute_fbank(padded_audio.data(), padded_len, SAMPLE_RATE, false);
+    padded_audio.clear();
+    padded_audio.shrink_to_fit();
+
+    const int nf_per_chunk = std::min(
+        static_cast<int>((CHUNK_SAMPLES - 400) / FBANK_FRAME_SHIFT) + 1,  // 998 for 160000 samples
+        global_fbank.num_frames);
+
+    std::vector<float> chunk_fbank(static_cast<size_t>(nf_per_chunk) * FBANK_NUM_BINS);
+    std::vector<float> masked_fbank_rowmajor;
+    if (coreml_ctx) {
+        masked_fbank_rowmajor.resize(static_cast<size_t>(nf_per_chunk) * FBANK_NUM_BINS);
+    }
+
     for (int c = 0; c < num_chunks; c++) {
-        const int chunk_start = c * STEP_SAMPLES;
-        int copy_len = num_samples - chunk_start;
-        if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
-        if (copy_len < 0) copy_len = 0;
+        // Slice this chunk's fbank frames from the global fbank and apply per-chunk CMN.
+        const int frame_offset = c * FBANK_STEP;
+        const int nf = std::min(nf_per_chunk, global_fbank.num_frames - frame_offset);
+        std::memcpy(chunk_fbank.data(),
+                    global_fbank.data.data() + static_cast<size_t>(frame_offset) * FBANK_NUM_BINS,
+                    static_cast<size_t>(nf) * FBANK_NUM_BINS * sizeof(float));
+        embedding::apply_cmn(chunk_fbank.data(), nf, FBANK_NUM_BINS);
 
-        std::fill(cropped.begin(), cropped.end(), 0.0f);
-        if (copy_len > 0) {
-            std::memcpy(cropped.data(), audio + chunk_start,
-                        static_cast<size_t>(copy_len) * sizeof(float));
-        }
-
-        embedding::fbank_result fbank =
-            embedding::compute_fbank(cropped.data(), CHUNK_SAMPLES, SAMPLE_RATE);
-        const int num_fbank_frames = fbank.num_frames;
-
-        // Optional scratch for CoreML path (row-major masked fbank).
-        std::vector<float> masked_fbank_rowmajor;
-        if (coreml_ctx) {
-            masked_fbank_rowmajor.resize(fbank.data.size());
-        }
+        const int num_fbank_frames = nf;
 
         // seg layout: [num_chunks, num_frames_per_chunk, num_speakers] row-major
         const float* seg_chunk =
@@ -206,8 +222,6 @@ bool extract_embeddings(
                 }
             }
         }
-
-
 
         for (int s = 0; s < num_speakers; s++) {
             float* emb_out =
@@ -230,7 +244,7 @@ bool extract_embeddings(
                     }
 
                     const float mask_val = seg_chunk[seg_frame * num_speakers + s];
-                    const float * src_row = fbank.data.data() + (size_t) ft * FBANK_NUM_BINS;
+                    const float * src_row = chunk_fbank.data() + (size_t) ft * FBANK_NUM_BINS;
                     float * dst_row = masked_fbank_rowmajor.data() + (size_t) ft * FBANK_NUM_BINS;
 
                     if (mask_val == 0.0f) {
@@ -249,7 +263,7 @@ bool extract_embeddings(
                     }
 
                     const float mask_val = seg_chunk[seg_frame * num_speakers + s];
-                    const float * src_row = fbank.data.data() + (size_t) ft * FBANK_NUM_BINS;
+                    const float * src_row = chunk_fbank.data() + (size_t) ft * FBANK_NUM_BINS;
                     if (mask_val == 0.0f) {
                         for (int b = 0; b < FBANK_NUM_BINS; b++) {
                             emb_state->fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = 0.0f;
@@ -284,15 +298,19 @@ bool extract_embeddings(
                     }
                 }
 
-                if (std::getenv("DIARIZATION_EMB_DEBUG_NAN") != nullptr) {
+                if (std::getenv("DIARIZATION_EMB_DEBUG") != nullptr) {
                     int nan_count = 0;
+                    int inf_count = 0;
+                    double l2_sq = 0.0;
                     for (int d = 0; d < EMBEDDING_DIM; d++) {
-                        if (std::isnan(emb_out[d])) {
-                            nan_count++;
-                        }
+                        if (std::isnan(emb_out[d])) nan_count++;
+                        else if (std::isinf(emb_out[d])) inf_count++;
+                        else l2_sq += (double)emb_out[d] * (double)emb_out[d];
                     }
-                    if (nan_count > 0) {
-                        fprintf(stderr, "[emb] NaNs in embedding: chunk=%d speaker=%d nan=%d/%d\n", c, s, nan_count, EMBEDDING_DIM);
+                    double l2 = std::sqrt(l2_sq);
+                    if (nan_count > 0 || inf_count > 0 || l2 < 1e-6 || l2 > 1e6) {
+                        fprintf(stderr, "[emb] chunk=%d spk=%d nan=%d inf=%d L2=%.4f\n",
+                                c, s, nan_count, inf_count, l2);
                     }
                 }
                 backend_nodes_total += emb_state->last_nodes_total;
@@ -487,6 +505,223 @@ static bool pipeline_parallel_seg_emb(
     return true;
 }
 #endif
+
+// ============================================================================
+// Parallel seg+emb pipeline (GGML backend — CPU/CUDA/Metal)
+// ============================================================================
+
+static bool pipeline_parallel_seg_emb_ggml(
+    segmentation::segmentation_model& seg_model,
+    segmentation::segmentation_state& seg_state,
+    embedding::embedding_model& emb_model,
+    embedding::embedding_state& emb_state,
+    const float* audio, int n_samples, int num_chunks,
+    float* binarized_out,
+    float* embeddings_out,
+    double& t_seg_ms, double& t_emb_ms)
+{
+    using Clock = std::chrono::high_resolution_clock;
+
+    std::atomic<int> chunks_segmented{0};
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::atomic<bool> seg_error{false};
+    double seg_time = 0.0;
+
+    std::vector<float> seg_logits(
+        static_cast<size_t>(num_chunks) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+
+    fprintf(stderr, "Segmentation+Embedding (parallel/ggml): %d chunks... ", num_chunks);
+    fflush(stderr);
+
+    // Producer: segmentation + per-chunk powerset (runs in dedicated thread)
+    std::thread seg_thread([&] {
+        auto t0 = Clock::now();
+        std::vector<float> cropped(CHUNK_SAMPLES, 0.0f);
+        std::vector<float> tmp(FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES);
+
+        for (int c = 0; c < num_chunks; c++) {
+            const int chunk_start = c * STEP_SAMPLES;
+            int copy_len = n_samples - chunk_start;
+            if (copy_len > CHUNK_SAMPLES) copy_len = CHUNK_SAMPLES;
+            if (copy_len < 0) copy_len = 0;
+
+            std::fill(cropped.begin(), cropped.end(), 0.0f);
+            if (copy_len > 0) {
+                std::memcpy(cropped.data(), audio + chunk_start,
+                            static_cast<size_t>(copy_len) * sizeof(float));
+            }
+
+            float* logits_out = seg_logits.data() +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES;
+
+            if (!segmentation::model_infer(seg_model, seg_state,
+                                           cropped.data(), CHUNK_SAMPLES,
+                                           logits_out,
+                                           FRAMES_PER_CHUNK * NUM_POWERSET_CLASSES)) {
+                fprintf(stderr, "Error: segmentation failed at chunk %d/%d\n", c + 1, num_chunks);
+                seg_error.store(true, std::memory_order_release);
+                chunks_segmented.store(num_chunks, std::memory_order_release);
+                cv.notify_one();
+                return;
+            }
+
+            // Transpose GGML output from [class, frame] to [frame, class]
+            std::memcpy(tmp.data(), logits_out, tmp.size() * sizeof(float));
+            for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
+                for (int k = 0; k < NUM_POWERSET_CLASSES; k++) {
+                    logits_out[f * NUM_POWERSET_CLASSES + k] = tmp[k * FRAMES_PER_CHUNK + f];
+                }
+            }
+
+            // Per-chunk powerset→binary
+            float* bin_out = binarized_out +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS;
+            diarization::powerset_to_multilabel(logits_out, 1, FRAMES_PER_CHUNK, bin_out);
+
+            chunks_segmented.store(c + 1, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(mtx);
+            }
+            cv.notify_one();
+
+            if ((c + 1) % 50 == 0 || c + 1 == num_chunks) {
+                fprintf(stderr, "%d/%d chunks", c + 1, num_chunks);
+                fflush(stderr);
+            }
+        }
+
+        seg_time = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    });
+
+    // Consumer: precompute global fbank, then masked embedding extraction (runs on main thread)
+    auto t_emb_start = Clock::now();
+    bool emb_ok = true;
+    {
+        static constexpr int FBANK_FRAME_SHIFT = 160;
+        static constexpr int FBANK_STEP = STEP_SAMPLES / FBANK_FRAME_SHIFT;
+
+        const int padded_len = (num_chunks - 1) * STEP_SAMPLES + CHUNK_SAMPLES;
+        std::vector<float> padded_audio(padded_len, 0.0f);
+        const int copy_len = std::min(padded_len, n_samples);
+        if (copy_len > 0) {
+            std::memcpy(padded_audio.data(), audio, static_cast<size_t>(copy_len) * sizeof(float));
+        }
+
+        embedding::fbank_result global_fbank =
+            embedding::compute_fbank(padded_audio.data(), padded_len, SAMPLE_RATE, false);
+        padded_audio.clear();
+        padded_audio.shrink_to_fit();
+
+        const int nf_per_chunk = std::min(
+            static_cast<int>((CHUNK_SAMPLES - 400) / FBANK_FRAME_SHIFT) + 1,
+            global_fbank.num_frames);
+
+        std::vector<float> chunk_fbank(static_cast<size_t>(nf_per_chunk) * FBANK_NUM_BINS);
+
+        for (int c = 0; c < num_chunks; c++) {
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv.wait(lk, [&] {
+                    return chunks_segmented.load(std::memory_order_acquire) > c;
+                });
+            }
+
+            if (seg_error.load(std::memory_order_acquire)) {
+                emb_ok = false;
+                break;
+            }
+
+            const int frame_offset = c * FBANK_STEP;
+            const int nf = std::min(nf_per_chunk, global_fbank.num_frames - frame_offset);
+            std::memcpy(chunk_fbank.data(),
+                        global_fbank.data.data() + static_cast<size_t>(frame_offset) * FBANK_NUM_BINS,
+                        static_cast<size_t>(nf) * FBANK_NUM_BINS * sizeof(float));
+            embedding::apply_cmn(chunk_fbank.data(), nf, FBANK_NUM_BINS);
+
+            const int num_fbank_frames = nf;
+            const float* seg_chunk = binarized_out +
+                static_cast<size_t>(c) * FRAMES_PER_CHUNK * NUM_LOCAL_SPEAKERS;
+
+            bool speaker_zero[NUM_LOCAL_SPEAKERS];
+            for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) speaker_zero[s] = true;
+            for (int f = 0; f < FRAMES_PER_CHUNK; f++) {
+                const float* frame = seg_chunk + f * NUM_LOCAL_SPEAKERS;
+                for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) {
+                    if (frame[s] != 0.0f) speaker_zero[s] = false;
+                }
+            }
+
+            for (int s = 0; s < NUM_LOCAL_SPEAKERS; s++) {
+                float* emb_out = embeddings_out +
+                    (c * NUM_LOCAL_SPEAKERS + s) * EMBEDDING_DIM;
+
+                if (speaker_zero[s]) {
+                    const float nan_val = std::nanf("");
+                    for (int d = 0; d < EMBEDDING_DIM; d++) emb_out[d] = nan_val;
+                    continue;
+                }
+
+                // Build masked+transposed fbank for GGML: [80][T] layout
+                emb_state.fbank_transposed.resize((size_t) num_fbank_frames * FBANK_NUM_BINS);
+                for (int ft = 0; ft < num_fbank_frames; ft++) {
+                    int seg_frame = static_cast<int>(
+                        static_cast<long long>(ft) * FRAMES_PER_CHUNK / num_fbank_frames);
+                    if (seg_frame >= FRAMES_PER_CHUNK) seg_frame = FRAMES_PER_CHUNK - 1;
+
+                    const float mask = seg_chunk[seg_frame * NUM_LOCAL_SPEAKERS + s];
+                    const float* src = chunk_fbank.data() + static_cast<size_t>(ft) * FBANK_NUM_BINS;
+                    if (mask == 0.0f) {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            emb_state.fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = 0.0f;
+                        }
+                    } else {
+                        for (int b = 0; b < FBANK_NUM_BINS; b++) {
+                            emb_state.fbank_transposed[(size_t) b * (size_t) num_fbank_frames + (size_t) ft] = src[b];
+                        }
+                    }
+                }
+
+                if (!embedding::model_infer_transposed(emb_model, emb_state,
+                                                       emb_state.fbank_transposed.data(), num_fbank_frames,
+                                                       emb_out, EMBEDDING_DIM)) {
+                    fprintf(stderr, "Error: GGML embedding failed at chunk %d speaker %d\n", c, s);
+                    const float nan_val = std::nanf("");
+                    for (int d = 0; d < EMBEDDING_DIM; d++) emb_out[d] = nan_val;
+                }
+
+                if (std::getenv("DIARIZATION_EMB_DEBUG") != nullptr) {
+                    int nan_count = 0;
+                    int inf_count = 0;
+                    double l2_sq = 0.0;
+                    for (int d = 0; d < EMBEDDING_DIM; d++) {
+                        if (std::isnan(emb_out[d])) nan_count++;
+                        else if (std::isinf(emb_out[d])) inf_count++;
+                        else l2_sq += (double)emb_out[d] * (double)emb_out[d];
+                    }
+                    double l2 = std::sqrt(l2_sq);
+                    if (nan_count > 0 || inf_count > 0 || l2 < 1e-6 || l2 > 1e6) {
+                        fprintf(stderr, "[emb-par] chunk=%d spk=%d nan=%d inf=%d L2=%.4f\n",
+                                c, s, nan_count, inf_count, l2);
+                    }
+                }
+            }
+        }
+    }
+    auto t_emb_end = Clock::now();
+
+    seg_thread.join();
+
+    if (seg_error.load(std::memory_order_acquire) || !emb_ok) {
+        return false;
+    }
+
+    t_seg_ms = seg_time;
+    t_emb_ms = std::chrono::duration<double, std::milli>(t_emb_end - t_emb_start).count();
+
+    fprintf(stderr, "done [seg %.0f ms | emb %.0f ms | parallel/ggml]\n", t_seg_ms, t_emb_ms);
+    return true;
+}
 
 // ============================================================================
 // URI extraction — filename without extension
@@ -715,6 +950,37 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
     }
 #endif
 
+    // --- GGML parallel path (seg + emb on separate threads) ---
+    // Opt-in via DIARIZATION_PARALLEL=1. On a single GPU, sequential is faster
+    // because seg and emb contend for the same compute resources.
+    if (!parallel_done && !use_seg_coreml && !use_emb_coreml &&
+        seg_model.ctx && emb_model.ctx && !config.bypass_embeddings &&
+        std::getenv("DIARIZATION_PARALLEL")) {
+        t_stage_start = Clock::now();
+        embeddings.resize(
+            static_cast<size_t>(num_chunks) * NUM_LOCAL_SPEAKERS * EMBEDDING_DIM);
+
+        if (!pipeline_parallel_seg_emb_ggml(seg_model, seg_state,
+                                            emb_model, emb_state,
+                                            audio, n_samples, num_chunks,
+                                            binarized.data(), embeddings.data(),
+                                            t_segmentation_ms, t_embeddings_ms)) {
+            goto cleanup;
+        }
+        t_powerset_ms = 0.0;
+
+        segmentation::state_free(seg_state);
+        segmentation::model_free(seg_model);
+        seg_state.sched = nullptr;
+        seg_model.ctx = nullptr;
+        embedding::state_free(emb_state);
+        embedding::model_free(emb_model);
+        emb_state.sched = nullptr;
+        emb_model.ctx = nullptr;
+
+        parallel_done = true;
+    }
+
     if (!parallel_done) {
     // --- Sequential segmentation ---
     t_stage_start = Clock::now();
@@ -905,6 +1171,25 @@ bool diarize_from_samples(const DiarizationConfig& config, const float* audio, i
             // ================================================================
             // Step 9: Filter embeddings
             // ================================================================
+
+            if (std::getenv("DIARIZATION_EMB_DEBUG") != nullptr) {
+                int total_emb = num_chunks * NUM_LOCAL_SPEAKERS;
+                int nan_emb = 0, zero_emb = 0, normal_emb = 0;
+                for (int i = 0; i < total_emb; i++) {
+                    const float* e = embeddings.data() + i * EMBEDDING_DIM;
+                    bool has_nan = false;
+                    double l2_sq = 0.0;
+                    for (int d = 0; d < EMBEDDING_DIM; d++) {
+                        if (std::isnan(e[d])) { has_nan = true; break; }
+                        l2_sq += (double)e[d] * (double)e[d];
+                    }
+                    if (has_nan) nan_emb++;
+                    else if (l2_sq < 1e-12) zero_emb++;
+                    else normal_emb++;
+                }
+                fprintf(stderr, "[emb-summary] total=%d nan=%d zero=%d normal=%d\n",
+                        total_emb, nan_emb, zero_emb, normal_emb);
+            }
 
             t_stage_start = Clock::now();
             std::vector<float> filtered_emb;

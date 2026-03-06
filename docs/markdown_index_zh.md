@@ -95,6 +95,21 @@
 - `docs/thesis_ch4_ch5_materials_to_extract.md`
   - 写论文第 4/5 章建议从代码提取的材料清单，附大量文件/函数指针。
 
+- `docs/cuda_fbank_precompute_optimization.md`
+  - CUDA/GGML 路径 fbank 全局预计算优化：消除 ~10x 冗余 FFT/mel 计算（从 CoreML 路径移植）。
+
+- `docs/cuda_pipeline_parallel_optimization.md`
+  - CUDA/GGML 路径 Seg/Emb 管线并行优化：producer-consumer 双线程，CUDA 并发分析。
+
+- `docs/cuda_sync_overhead_optimization.md`
+  - CUDA 同步开销分析：segmentation 计算图缓存尝试（已回退），ggml scheduler 同步点分析。
+
+- `docs/cuda_embedding_correctness_fix.md`
+  - CUDA embedding 正确性诊断工具：`DIARIZATION_EMB_DEBUG` 环境变量，L2/NaN/Inf 检查，过滤前汇总。
+
+- `docs/cuda_benchmark_results.md`
+  - CUDA 优化基准测试结果：Tesla T4 上基线 vs 优化版对比（Embedding -10.4%, Total -7.3%），各优化项状态总结。
+
 ## G. 学术正文草稿
 
 - `CHAPTER4_ACADEMIC.md`
